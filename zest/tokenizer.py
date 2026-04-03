@@ -3,7 +3,7 @@ ZEST Tokenizer: Zoned Encoding of Sequence Traits.
 
 A domain-aware tokenizer that uses greedy max-match over a trie of
 recurring patterns (traits) mined from domain data. Long patterns are
-prioritized; unmatched regions fall back to base alphabet characters.
+prioritized while unmatched regions fall back to base alphabet characters.
 """
 import json
 import os
@@ -16,7 +16,7 @@ import torch
 
 class _TrieNode:
     __slots__ = ["children", "token_id"]
-
+    # When hours of leetcode finally makes sense
     def __init__(self):
         self.children: Dict[str, "_TrieNode"] = {}
         self.token_id: int = -1
@@ -58,6 +58,8 @@ class ZESTTokenizer:
             self.vocab[centroid] = tid
             self._insert(centroid, tid)
             for member in members:
+                if member == centroid:
+                    continue
                 self.vocab[member] = tid
                 self._insert(member, tid)
 

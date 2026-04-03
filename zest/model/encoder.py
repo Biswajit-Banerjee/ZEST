@@ -7,10 +7,6 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 
-# ---------------------------------------------------------------------------
-# Rotary Position Embeddings (RoPE)
-# ---------------------------------------------------------------------------
-
 class RotaryPositionalEmbedding(nn.Module):
     """RoPE with optional linear scaling for sequences longer than max_tokens."""
 
@@ -40,54 +36,6 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, pos_emb: torch.Tensor
     cos, sin = pos_emb.cos(), pos_emb.sin()
     return (q * cos + _rotate_half(q) * sin,
             k * cos + _rotate_half(k) * sin)
-
-
-# ---------------------------------------------------------------------------
-# Scaled Positional Embedding (for residue-level positions)
-# ---------------------------------------------------------------------------
-
-class ScaledPositionalEmbedding(nn.Module):
-    """Learned embeddings with ALiBi-style extrapolation beyond the table size."""
-
-    def __init__(self, num_embeddings: int, embedding_dim: int,
-                 extend_strategy: str = "alibi", padding_idx: int | None = None):
-        super().__init__()
-        self.embedding = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
-        self.extend_strategy = extend_strategy
-        self.num_embeddings = num_embeddings
-        self.padding_idx = padding_idx
-
-        max_idx = num_embeddings - 1
-        content_max = max(0, min(max_idx - 1, padding_idx - 1)) if padding_idx is not None else max_idx
-        self.register_buffer("content_max", torch.tensor(content_max), persistent=False)
-
-        if extend_strategy == "alibi":
-            slopes = torch.logspace(0, -3, steps=embedding_dim, base=2.0)
-            self.register_buffer("alibi_slopes", slopes, persistent=False)
-
-    def forward(self, positions: torch.Tensor) -> torch.Tensor:
-        positions = positions.long()
-        pad_mask = (positions == self.padding_idx) if self.padding_idx is not None else None
-        clamped = positions.clamp(min=0, max=int(self.content_max.item()))
-        if pad_mask is not None:
-            clamped = torch.where(pad_mask, torch.full_like(clamped, self.padding_idx), clamped)
-
-        emb = self.embedding(clamped)
-
-        if self.extend_strategy == "alibi":
-            excess = (positions - self.content_max).clamp_min(0)
-            if pad_mask is not None:
-                excess = torch.where(pad_mask, torch.zeros_like(excess), excess)
-            emb = emb + excess.unsqueeze(-1) * self.alibi_slopes
-
-        if pad_mask is not None:
-            emb = emb.masked_fill(pad_mask.unsqueeze(-1), 0.0)
-        return emb
-
-
-# ---------------------------------------------------------------------------
-# Pre-norm Attention Block with SwiGLU FFN
-# ---------------------------------------------------------------------------
 
 class AttentionBlock(nn.Module):
     """
@@ -163,10 +111,6 @@ class AttentionBlock(nn.Module):
         x = x + self.dropout(ff)
         return x
 
-
-# ---------------------------------------------------------------------------
-# Full Encoder
-# ---------------------------------------------------------------------------
 
 class Encoder(nn.Module):
     """Stacked transformer encoder with RoPE and optional gradient checkpointing."""

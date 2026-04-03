@@ -1,23 +1,19 @@
 """
-TraitEncoder: Layered Extraction of Meaningful Order in Nature.
-
+TraitEncoder.
 Two-stage encoder model:
-  1. Masked Profile Modeling (MPM) — learns domain-specific conservation patterns
-  2. Hierarchical contrastive fine-tuning — learns structural similarity
+  1. Masked Language Modeling (MLM)
+  2. Hierarchical contrastive fine-tuning
 """
 import logging
-from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from zest.model.encoder import Encoder, ScaledPositionalEmbedding
+from zest.model.encoder import Encoder
 from zest.model.pooling import AttentionAggregator
-from zest.model.heads import ProfileExpansionHead, SimilarityHead
 
 _log = logging.getLogger(__name__)
-
 
 class TraitEncoder(nn.Module):
 
@@ -37,13 +33,8 @@ class TraitEncoder(nn.Module):
         global_extend_strategy: str = "alibi",
         num_proj_layers: int = 2,
         proj_ff_mult: int = 2,
-        # Legacy / ignored kwargs for checkpoint compat
-        cath_counts=None,
-        max_seq_len: int | None = None,
     ):
         super().__init__()
-        if max_seq_len is not None and max_tokens == 1024:
-            max_tokens = max_seq_len
 
         self.core = Encoder(
             vocab_size=vocab_size, embed_dim=embed_dim, num_layers=num_layers,
@@ -53,24 +44,8 @@ class TraitEncoder(nn.Module):
         self.max_tokens = max_tokens
         self.max_residues = max_tokens * 4
 
-        # Positional embeddings for residue-level heads
-        self.global_pos_emb = ScaledPositionalEmbedding(
-            self.max_residues, embed_dim,
-            extend_strategy=global_extend_strategy, padding_idx=None,
-        )
-
-        # Pretraining heads
-        self.profile_head = ProfileExpansionHead(
-            embed_dim, self.max_residues, vocab_size=20,
-            extend_strategy=global_extend_strategy,
-        )
-        self.mlm_head = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim), nn.GELU(),
-            nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 20),
-        )
-        self.token_mlm_proj = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.LayerNorm(embed_dim),
-        )
+        # to train MLM on token level
+        self.token_mlm_proj = self.bottleneck_mlp(embed_dim, embed_dim//2, embed_dim, dropout, 1, last_linear=False)
 
         # Similarity components
         self.proj_dim = proj_dim or embed_dim
@@ -80,25 +55,13 @@ class TraitEncoder(nn.Module):
         # Projector: bottleneck MLP
         self.num_proj_layers = num_proj_layers
         self.proj_ff_mult = proj_ff_mult
-        layers = []
         hidden = embed_dim * proj_ff_mult
-        for _ in range(num_proj_layers):
-            layers.extend([
-                nn.Linear(embed_dim, hidden), nn.BatchNorm1d(hidden),
-                nn.GELU(), nn.Dropout(dropout),
-                nn.Linear(hidden, embed_dim), nn.BatchNorm1d(embed_dim),
-                nn.GELU(), nn.Dropout(dropout),
-            ])
-        layers.append(nn.Linear(embed_dim, self.proj_dim))
-        self.projector = nn.Sequential(*layers)
-
-        self.sim_head = SimilarityHead(self.proj_dim, dropout=dropout)
-
+        self.projector = self.bottleneck_mlp(embed_dim, hidden, self.proj_dim, dropout, self.num_proj_layers) 
+        
         self.config = {
             "vocab_size": vocab_size, "embed_dim": embed_dim,
             "num_layers": num_layers, "nhead": nhead, "ff_mult": ff_mult,
             "dropout": dropout, "max_tokens": max_tokens,
-            "max_seq_len": max_tokens,
             "proj_dim": self.proj_dim, "pool_type": pool_type,
             "padding_idx": padding_idx,
             "rope_scaling_type": rope_scaling_type,
@@ -109,7 +72,20 @@ class TraitEncoder(nn.Module):
     # ------------------------------------------------------------------
     # Core forward methods
     # ------------------------------------------------------------------
-
+    def bottleneck_mlp(self, input_dim, hidden, output_dim, dropout, num_proj_layers, last_linear=True):
+        layers = []
+        for _ in range(num_proj_layers):
+            layers.extend([
+                nn.Linear(input_dim, hidden), nn.BatchNorm1d(hidden),
+                nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(hidden, input_dim), nn.BatchNorm1d(input_dim),
+                nn.GELU(), nn.Dropout(dropout),
+            ])
+        
+        if last_linear:
+            layers.append(nn.Linear(input_dim, output_dim))
+        return nn.Sequential(*layers)
+        
     def _encode_tokens(self, tokens, mask=None):
         if self._core_is_frozen():
             with torch.no_grad():
@@ -127,29 +103,6 @@ class TraitEncoder(nn.Module):
         if normalize:
             proj = F.normalize(proj, p=2, dim=-1)
         return proj
-
-    def forward_mpm(self, tokens, mask, global_indices, token_lengths):
-        """MPM forward: profile logits + projected embedding."""
-        token_embs = self.core(tokens, mask)
-        logits = self.profile_head(token_embs, token_lengths, global_indices,
-                                   self.global_pos_emb)
-        family = self.aggregator(token_embs, mask)
-        proj = F.normalize(self.projector(family), p=2, dim=-1)
-        return logits, proj
-
-    def forward_mpm_mlm(self, tokens, mask, global_indices, token_lengths):
-        """Combined forward: profile + residue MLM + token MLM in one pass."""
-        token_embs = self.core(tokens, mask)
-        z = self.profile_head.get_residue_embeddings(
-            token_embs, token_lengths, global_indices, self.global_pos_emb,
-        )
-        profile_logits = self.profile_head.output_proj(z)
-        mlm_logits = self.mlm_head(z)
-        h = self.token_mlm_proj(token_embs)
-        token_logits = F.linear(h, self.core.token_emb.weight)
-        family = self.aggregator(token_embs, mask)
-        proj = F.normalize(self.projector(family), p=2, dim=-1)
-        return profile_logits, mlm_logits, token_logits, proj
 
     def forward_token_mlm(self, tokens, mask):
         """Token-level MLM with tied input embedding weights."""
@@ -179,10 +132,8 @@ class TraitEncoder(nn.Module):
     def freeze_for_similarity(self):
         """Freeze everything except aggregator, projector, similarity head."""
         self.freeze_core()
-        for module in [self.mlm_head, self.profile_head, self.global_pos_emb,
-                       self.token_mlm_proj]:
-            for p in module.parameters():
-                p.requires_grad = False
+        for p in self.token_mlm_proj.parameters():
+            p.requires_grad = False
         self.temperature.requires_grad = False
 
     # ------------------------------------------------------------------
@@ -200,7 +151,6 @@ class TraitEncoder(nn.Module):
         ckpt = torch.load(path, map_location=device, weights_only=False)
         config = dict(ckpt.get("config", {}))
         config.pop("num_superfamilies", None)
-        config.pop("cath_counts", None)
         sd = ckpt.get("model_state_dict", {})
 
         # Strip legacy keys
