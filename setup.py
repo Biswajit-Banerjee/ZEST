@@ -14,6 +14,7 @@ setup(
         "scikit-learn>=1.3.0",
         "tqdm>=4.65.0",
         "pyarrow>=13.0.0",
+        "gdown>=5.0.0",
     ],
     extras_require={
         "code": ["tree-sitter-languages>=1.10.0", "tokenizers>=0.15.0"],
