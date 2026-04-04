@@ -501,8 +501,9 @@ def main():
     model, ckpt = TraitEncoder.load_pretrained(args.checkpoint, device="cpu", **overrides)
     model = model.to(device)
 
-    # Freeze / unfreeze
-    model.freeze_for_similarity()
+    # Start fully frozen, then selectively unfreeze below
+    for p in model.parameters():
+        p.requires_grad = False
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     n_layers = m.core.num_layers
 
@@ -523,7 +524,7 @@ def main():
             p.requires_grad = True
 
     # Always train these
-    for module in [m.aggregator, m.projector, m.sim_head]:
+    for module in [m.aggregator, m.projector]:
         for p in module.parameters():
             p.requires_grad = True
 

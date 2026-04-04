@@ -190,8 +190,7 @@ def build_llrd_param_groups(model, base_lr: float, head_lr: float,
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     n_layers = m.core.num_layers
     if head_prefixes is None:
-        head_prefixes = ("profile_head", "token_mlm_proj", "mlm_head",
-                         "global_pos_emb", "aggregator", "projector", "sim_head",
+        head_prefixes = ("token_mlm_proj", "aggregator", "projector",
                          "temperature")
 
     head_params = [p for n, p in m.named_parameters()
