@@ -18,6 +18,7 @@ import argparse
 import logging
 import random
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -32,6 +33,7 @@ from zest.tokenizer import ZESTTokenizer
 from zest.data.finetune import HierarchicalPairDataset, finetune_collate_fn
 from zest.training.utils import (
     CheckpointManager, build_cosine_schedule, build_llrd_param_groups, setup_logging,
+    make_run_dir, save_environment, save_model_arch,
 )
 
 _log = logging.getLogger(__name__)
@@ -306,8 +308,7 @@ def _sparse_mlm_loss(model, token_embs, token_labels):
     masked = token_labels != -100
     if not masked.any():
         return zero, zero
-    h = m.token_mlm_proj(token_embs)
-    logits = F.linear(h, m.core.token_emb.weight)
+    logits = F.linear(token_embs, m.core.token_emb.weight)
     loss = F.cross_entropy(logits[masked], token_labels[masked])
     acc = (logits[masked].argmax(-1) == token_labels[masked]).float().mean()
     return loss, acc
@@ -434,8 +435,7 @@ def parse_args():
     p.add_argument("--val-shards-dir", default="data/pair_shards/val")
     p.add_argument("--shards-per-epoch", type=int, default=None)
     p.add_argument("--output-dir", default="outputs/models")
-    p.add_argument("--run-dir", default=None)
-    p.add_argument("--resume", action="store_true")
+    p.add_argument("--run-dir", default=None, help="Run directory (inferred from --checkpoint if given)")
 
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--batch-size", type=int, default=128)
@@ -531,8 +531,13 @@ def main():
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    ckpt_mgr = CheckpointManager(args.output_dir, "theme_encoder_hier", "finetune", "hier",
-                                  run_dir=args.run_dir)
+    # Determine run directory (infer from pretrain checkpoint path)
+    if args.run_dir:
+        run_dir = Path(args.run_dir)
+    else:
+        run_dir = Path(args.checkpoint).parent.parent
+
+    ckpt_mgr = CheckpointManager(run_dir, phase="finetune")
     log = setup_logging("finetune", str(ckpt_mgr.log_path))
     log.info("Model: %.1fM total, %.1fM trainable (%.1f%%)",
              total / 1e6, trainable / 1e6, 100 * trainable / total)
@@ -610,11 +615,14 @@ def main():
                  epoch, args.epochs, elapsed, avg["loss"], avg["con"],
                  avg["sap"], avg["rank"], avg["acc_h"])
 
-        ckpt_mgr.add_metrics("train", epoch, avg)
-        ckpt_mgr.save(model, optimizer, scheduler, epoch)
+        current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else args.lr
+        ckpt_mgr.save(
+            model, optimizer, scheduler, epoch,
+            train_metrics=avg, lr=current_lr, train_elapsed_s=elapsed,
+        )
 
     log.info("=" * 50)
-    log.info("Fine-tuning complete. Checkpoints: %s", ckpt_mgr.models_dir)
+    log.info("Fine-tuning complete. Checkpoints: %s", ckpt_mgr.phase_dir)
 
 
 if __name__ == "__main__":

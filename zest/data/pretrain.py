@@ -1,10 +1,7 @@
-"""
-MPM (Masked Profile Modeling) pretraining dataset.
+"""Pretraining datasets.
 
-Each sample provides:
-  - BPE token IDs (with optional masking for token-level MLM)
-  - HMM emission profiles as soft regression targets
-  - Token-to-residue alignment for the profile expansion head
+- MLMDataset: Domain-agnostic masked language modeling (works for both code and proteins)
+- ProteinMPMDataset: Protein-specific masked profile modeling with HMM emission targets
 """
 import glob
 import logging
@@ -12,12 +9,152 @@ import os
 import random
 from typing import Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
+from zest.data.loaders import load_parquet, load_sequences
+
 _log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Domain-agnostic MLM dataset
+# ---------------------------------------------------------------------------
+
+class MLMDataset(Dataset):
+    """Domain-agnostic dataset for masked language model pretraining.
+
+    Reads raw text sequences from parquet or text files, tokenizes on-the-fly
+    with optional trie dropout, and returns token IDs. Masking is applied in
+    the collate function.
+
+    Streaming mode (parquet shards):
+        When ``data_path`` is a directory of ``.parquet`` files and
+        ``shards_per_epoch`` is set, only *N* shards are loaded into memory
+        per epoch.  Call :meth:`load_epoch` before each epoch to rotate shards.
+    """
+
+    def __init__(self, data_path: str, tokenizer, *,
+                 is_training: bool = True,
+                 max_tokens: Optional[int] = None,
+                 trie_dropout: float = 0.0,
+                 seq_column: str = "sequence",
+                 shards_per_epoch: Optional[int] = None,
+                 unique_shards: bool = False,
+                 seed: int = 42):
+        self.tokenizer = tokenizer
+        self.is_training = is_training
+        self.max_tokens = max_tokens
+        self.trie_dropout = trie_dropout
+        self._seq_column = seq_column
+        self._seed = seed
+        self._unique = unique_shards
+
+        # Discover parquet shards
+        self._shard_paths: List[str] = []
+        if os.path.isdir(data_path):
+            self._shard_paths = sorted(glob.glob(os.path.join(data_path, "*.parquet")))
+
+        self._shards_per_epoch = shards_per_epoch
+        self.streaming = bool(self._shard_paths and shards_per_epoch)
+
+        # Pre-compute non-overlapping shard schedule when unique_shards=True
+        self._shard_schedule: Optional[List[List[str]]] = None
+        if self.streaming and self._unique:
+            rng = random.Random(self._seed)
+            shuffled = list(self._shard_paths)
+            rng.shuffle(shuffled)
+            n = self._shards_per_epoch
+            self._shard_schedule = [
+                shuffled[i:i + n] for i in range(0, len(shuffled), n)
+            ]
+            total_ep = len(self._shard_schedule)
+            _log.info("MLMDataset: unique-shard mode — %d shards, %d/epoch, %d epochs for full pass",
+                      len(self._shard_paths), n, total_ep)
+
+        if self.streaming:
+            if not self._unique:
+                _log.info("MLMDataset: streaming mode — %d shards, %d per epoch from %s",
+                          len(self._shard_paths), shards_per_epoch, data_path)
+            self._seqs: List[str] = []
+            self.load_epoch(0)
+        else:
+            self._seqs = load_sequences(data_path, seq_column)
+            _log.info("MLMDataset: %d sequences from %s", len(self._seqs), data_path)
+
+    @property
+    def num_epochs_for_full_pass(self) -> Optional[int]:
+        """Number of epochs needed to see every shard exactly once (unique mode only)."""
+        return len(self._shard_schedule) if self._shard_schedule else None
+
+    def load_epoch(self, epoch: int) -> None:
+        """Load a new subset of shards for this epoch.  No-op if not streaming."""
+        if not self.streaming:
+            return
+
+        if self._shard_schedule is not None:
+            idx = epoch % len(self._shard_schedule)
+            selected = self._shard_schedule[idx]
+        else:
+            n = min(self._shards_per_epoch, len(self._shard_paths))
+            rng = random.Random(self._seed + epoch)
+            selected = rng.sample(self._shard_paths, n)
+
+        seqs: List[str] = []
+        for path in selected:
+            df = pd.read_parquet(path)
+            col = self._seq_column
+            for c in [col, "raw_sequence", "sequence", "text", "code"]:
+                if c in df.columns:
+                    col = c
+                    break
+            seqs.extend(df[col].tolist())
+        self._seqs = seqs
+        _log.info("Epoch %d: loaded %d shards (%d sequences)", epoch, len(selected), len(self._seqs))
+
+    def __len__(self) -> int:
+        return len(self._seqs)
+
+    def __getitem__(self, idx: int):
+        dropout = self.trie_dropout if self.is_training else 0.0
+        ids = self.tokenizer.encode(self._seqs[idx], dropout=dropout)
+        if self.max_tokens and len(ids) > self.max_tokens:
+            ids = ids[:self.max_tokens]
+        return {"input_ids": torch.tensor(ids, dtype=torch.long)}
+
+
+def mlm_collate_fn(batch: List[Dict], pad_id: int = 0, mask_id: int = 4,
+                   vocab_size: int = 32000, mask_prob: float = 0.15):
+    """Collate with BERT-style masking: 80% [MASK], 10% random, 10% keep."""
+    ids = pad_sequence([b["input_ids"] for b in batch],
+                       batch_first=True, padding_value=pad_id)
+    attn_mask = ids != pad_id
+    masked_ids = ids.clone()
+    token_labels = torch.full_like(ids, -100)
+
+    if mask_prob > 0:
+        prob = torch.full(ids.shape, mask_prob).masked_fill_(~attn_mask, 0.0)
+        to_mask = torch.bernoulli(prob).bool()
+
+        replace = torch.bernoulli(torch.full(ids.shape, 0.8)).bool() & to_mask
+        masked_ids[replace] = mask_id
+        rand_pos = torch.bernoulli(torch.full(ids.shape, 0.5)).bool() & to_mask & ~replace
+        masked_ids[rand_pos] = torch.randint(2, vocab_size, ids.shape)[rand_pos]
+
+        token_labels[to_mask] = ids[to_mask]
+
+    return {
+        "input_ids": masked_ids,
+        "attention_mask": attn_mask,
+        "token_labels": token_labels,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Protein-specific MPM dataset (kept for biology experiments)
+# ---------------------------------------------------------------------------
 
 AA_TO_IDX = {
     "A": 0, "C": 1, "D": 2, "E": 3, "F": 4, "G": 5, "H": 6, "I": 7,
@@ -27,19 +164,8 @@ AA_TO_IDX = {
 AA_SANITIZE = {"B": "D", "J": "L", "O": "K", "U": "C", "X": "A", "Z": "E"}
 
 
-def _load_parquet(path: str, columns=None) -> pd.DataFrame:
-    if os.path.isdir(path):
-        files = sorted(glob.glob(os.path.join(path, "*.parquet")))
-        if not files:
-            raise FileNotFoundError(f"No parquet files in {path}")
-        return pd.concat([pd.read_parquet(f, columns=columns) for f in files],
-                         ignore_index=True)
-    return pd.read_parquet(path, columns=columns)
-
-
-class PretrainDataset(Dataset):
-    """
-    Dataset for Masked Profile Modeling.
+class ProteinMPMDataset(Dataset):
+    """Protein masked profile modeling dataset.
 
     Expects:
       - sequences_path: parquet with columns [hmm_id, raw_sequence, alignment_indices]
@@ -48,23 +174,24 @@ class PretrainDataset(Dataset):
 
     def __init__(self, sequences_path: str, emissions_path: str, tokenizer,
                  is_training: bool = True, hmm_ids: Optional[List[str]] = None,
-                 max_tokens: Optional[int] = None):
+                 max_tokens: Optional[int] = None, trie_dropout: float = 0.0):
         self.tokenizer = tokenizer
         self.is_training = is_training
         self.max_tokens = max_tokens
+        self.trie_dropout = trie_dropout
         self._background = [0.0] * 20
 
-        df = _load_parquet(sequences_path, columns=["hmm_id", "raw_sequence", "alignment_indices"])
+        df = load_parquet(sequences_path, columns=["hmm_id", "raw_sequence", "alignment_indices"])
         if hmm_ids is not None:
             df = df[df["hmm_id"].isin(set(hmm_ids))].reset_index(drop=True)
 
-        em_df = _load_parquet(emissions_path, columns=["hmm_id", "emission_matrix"])
+        em_df = load_parquet(emissions_path, columns=["hmm_id", "emission_matrix"])
         self.emissions: Dict[str, list] = em_df.set_index("hmm_id")["emission_matrix"].to_dict()
 
         self._ids = df["hmm_id"].to_numpy()
         self._seqs = df["raw_sequence"].to_numpy()
         self._alns = df["alignment_indices"].tolist()
-        _log.info("PretrainDataset: %d samples", len(df))
+        _log.info("ProteinMPMDataset: %d samples", len(df))
 
     def __len__(self) -> int:
         return len(self._ids)
@@ -77,7 +204,7 @@ class PretrainDataset(Dataset):
             aln_idx = list(aln_idx)
 
         emissions = self.emissions[hmm_id]
-        dropout = random.uniform(0.0, 0.5) if self.is_training else 0.0
+        dropout = self.trie_dropout if self.is_training else 0.0
 
         text = self.tokenizer._ws.sub("", raw_seq).upper()
         segments = self.tokenizer._segment(text, dropout=dropout)
@@ -116,17 +243,9 @@ class PretrainDataset(Dataset):
         }
 
 
-def pretrain_collate_fn(batch: List[Dict], pad_id: int = 0, mask_id: int = 4,
-                        vocab_size: int = 32000, apply_mask: bool = True,
-                        mask_prob: float = 0.15):
-    """
-    Collate with optional BERT-style masking for token-level MLM.
-
-    Returns both masked and original token IDs so the profile head always
-    sees unmasked input while the token MLM head predicts masked positions.
-    """
-    from torch.nn.utils.rnn import pad_sequence
-
+def mpm_collate_fn(batch: List[Dict], pad_id: int = 0, mask_id: int = 4,
+                   vocab_size: int = 32000, mask_prob: float = 0.15):
+    """Collate for MPM: pads all fields including emission targets and AA labels."""
     ids = pad_sequence([b["input_ids"] for b in batch], batch_first=True, padding_value=pad_id)
     tgt = pad_sequence([b["targets"] for b in batch], batch_first=True, padding_value=0.0)
     gi = pad_sequence([b["global_indices"] for b in batch], batch_first=True, padding_value=0)
@@ -136,19 +255,17 @@ def pretrain_collate_fn(batch: List[Dict], pad_id: int = 0, mask_id: int = 4,
 
     attn_mask = ids != pad_id
     masked_ids = ids.clone()
-    token_labels = None
+    token_labels = torch.full_like(ids, -100)
 
-    if apply_mask and mask_prob > 0:
+    if mask_prob > 0:
         prob = torch.full(ids.shape, mask_prob).masked_fill_(~attn_mask, 0.0)
         to_mask = torch.bernoulli(prob).bool()
 
-        # 80% replace with [MASK], 10% random, 10% keep
         replace = torch.bernoulli(torch.full(ids.shape, 0.8)).bool() & to_mask
         masked_ids[replace] = mask_id
         rand_pos = torch.bernoulli(torch.full(ids.shape, 0.5)).bool() & to_mask & ~replace
         masked_ids[rand_pos] = torch.randint(2, vocab_size, ids.shape)[rand_pos]
 
-        token_labels = torch.full_like(ids, -100)
         token_labels[to_mask] = ids[to_mask]
 
     return {

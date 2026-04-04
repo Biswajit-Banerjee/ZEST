@@ -2,11 +2,13 @@
 Token-level MLM pretraining for ThemeEncoder.
 
 Usage:
-    python -m zest.training.pretrain --model efficient-deep --epochs 8
+    python -m zest.training.pretrain --model base --epochs 8
 """
 import argparse
 import json
 import random
+import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -17,9 +19,10 @@ from tqdm import tqdm
 
 from zest.model.theme_encoder import create_theme_encoder
 from zest.tokenizer import ZESTTokenizer
-from zest.data.pretrain import PretrainDataset, pretrain_collate_fn
+from zest.data.pretrain import MLMDataset, mlm_collate_fn
 from zest.training.utils import (
     CheckpointManager, build_cosine_schedule, setup_logging,
+    make_run_dir, save_environment, save_model_arch,
 )
 
 GRAD_CLIP = 1.0
@@ -28,10 +31,6 @@ GRAD_CLIP = 1.0
 def _is_oom(err):
     return "out of memory" in str(err).lower()
 
-
-# ---------------------------------------------------------------------------
-# Train / eval steps
-# ---------------------------------------------------------------------------
 
 def train_step(batch, model, device, amp, ga):
     ids = batch["input_ids"].to(device)
@@ -71,37 +70,46 @@ def eval_step(batch, model, device, amp):
     return {"loss": loss, "acc": acc}
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def parse_args():
     p = argparse.ArgumentParser(description="ThemeEncoder MLM pretraining")
-    p.add_argument("--model", default="base", choices=["base", "efficient-deep", "deep-wide"])
-    p.add_argument("--epochs", type=int, default=8)
-    p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--grad-accum-steps", type=int, default=1)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--warmup-ratio", type=float, default=0.05)
-    p.add_argument("--mask-prob", type=float, default=0.15)
-    p.add_argument("--max-tokens", type=int, default=1024)
-    p.add_argument("--amp", action="store_true")
-    p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--tokenizer", default="data/tokens.json")
-    p.add_argument("--sequences", default="data/sequences")
-    p.add_argument("--train-ids", default="data/train_ids.json")
-    p.add_argument("--val-ids", default="data/val_ids.json")
-    p.add_argument("--output-dir", default="outputs/models")
-    p.add_argument("--run-dir", default=None)
-    p.add_argument("--checkpoint", default=None, help="Warm-start from checkpoint")
+    p.add_argument("--model",            default="base",  choices=["test", "base", "deep"],  help="Model architecture")
+    p.add_argument("--epochs",           default=8,       type=int,    help="Number of training epochs")
+    p.add_argument("--batch-size",       default=128,     type=int,    help="Batch size per GPU")
+    p.add_argument("--grad-accum-steps", default=8,       type=int,    help="Gradient accumulation steps") # 128 * 8 = 1024
+    p.add_argument("--lr",               default=5e-4,    type=float,  help="Learning rate")
+    p.add_argument("--warmup-ratio",     default=0.05,    type=float,  help="Warmup ratio")
+    p.add_argument("--mask-prob",        default=0.3,     type=float,  help="Masking probability") # 30% masking
+    p.add_argument("--trie-dropout",     default=0.15,    type=float,  help="Trie level dropout")  # 15% trie level dropout
+    p.add_argument("--max-tokens",       default=512,     type=int,    help="Maximum sequence length")
+    p.add_argument("--num-workers",      default=8,       type=int,    help="Number of data loading workers")
+    p.add_argument("--seed",             default=42,      type=int,    help="Random seed for reproducibility")
+    p.add_argument("--val-every",        default=1,       type=int,    help="Run validation every N epochs")
+    p.add_argument("--tokenizer",        default="data/tokens/tedlh_zest_32K.json",     help="Tokenizer file path")
+    p.add_argument("--train-data",       required=True,                help="Training sequences (FASTA dir/file, parquet, or txt)")
+    p.add_argument("--val-data",         required=True,                help="Validation sequences (FASTA dir/file, parquet, or txt)")
+    p.add_argument("--shards-per-epoch", default=None, type=int,       help="Parquet shards to load per epoch (streaming mode)")
+    p.add_argument("--unique-shards",    action="store_true",          help="Each shard seen exactly once (no repeat across epochs)")
+    p.add_argument("--output-dir",       default="outputs/models",     help="Output directory for checkpoints")
+    p.add_argument("--run-dir",          default=None,                 help="Run directory (inferred from --checkpoint if given)")
+    p.add_argument("--checkpoint",       default=None,                 help="Resume from checkpoint (infers run-dir)")
+    p.add_argument("--amp",              action="store_true",          help="Use automatic mixed precision")
+    p.add_argument("--keep-all-checkpoints", action="store_true",      help="Keep all checkpoints (default: last 3)")
+    
     return p.parse_args()
+
+
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def main():
     args = parse_args()
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
+    seed_everything(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = args.amp
@@ -111,88 +119,185 @@ def main():
             torch.backends.cuda.matmul.allow_tf32 = True
             amp = True
 
-    ckpt_mgr = CheckpointManager(args.output_dir, "theme_encoder_mlm", args.model, "mlm",
-                                  run_dir=args.run_dir)
+    # Determine run directory
+    if args.checkpoint:
+        run_dir = Path(args.checkpoint).parent.parent
+    elif args.run_dir:
+        run_dir = Path(args.run_dir)
+    else:
+        run_dir = make_run_dir(args.output_dir, args.model)
+
+    keep_n = 999 if args.keep_all_checkpoints else 3
+    ckpt_mgr = CheckpointManager(run_dir, phase="pretrain", keep_last_n=keep_n)
     log = setup_logging("pretrain", str(ckpt_mgr.log_path))
 
     tokenizer = ZESTTokenizer(args.tokenizer)
-    train_ids = json.loads(open(args.train_ids).read()) if args.train_ids else None
-    val_ids = json.loads(open(args.val_ids).read()) if args.val_ids else None
 
-    train_ds = PretrainDataset(args.sequences, tokenizer,
-                                is_training=True, ids=train_ids)
-    val_ds = PretrainDataset(args.sequences, tokenizer,
-                              is_training=False, ids=val_ids)
+    train_ds = MLMDataset(
+        args.train_data, tokenizer,
+        is_training=True,
+        max_tokens=args.max_tokens, trie_dropout=args.trie_dropout,
+        shards_per_epoch=args.shards_per_epoch,
+        unique_shards=args.unique_shards, seed=args.seed,
+    )
+    val_ds = MLMDataset(
+        args.val_data, tokenizer,
+        is_training=False,
+        max_tokens=args.max_tokens,
+    )
 
-    collate = lambda b: pretrain_collate_fn(
-        b, tokenizer.pad_id, tokenizer.mask_id, tokenizer.vocab_size, args.mask_prob)
+    collate = lambda b: mlm_collate_fn(
+        b, tokenizer.pad_id, tokenizer.mask_id, tokenizer.vocab_size,
+        mask_prob=args.mask_prob,
+    )
 
     model = create_theme_encoder(args.model, tokenizer.vocab_size, args.max_tokens).to(device)
-    if args.checkpoint:
-        log.info("Loading checkpoint: %s", args.checkpoint)
-        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"], strict=False)
-
     total_params = sum(p.numel() for p in model.parameters())
     log.info("Model: %s (%.1fM params)", args.model, total_params / 1e6)
 
     bs, ga = args.batch_size, args.grad_accum_steps
     nw = args.num_workers
-    pf = 2 if nw > 0 else None
+    pf = 8 if nw > 0 else None
+
+    def make_loader(ds, shuffle=True, drop_last=True, persistent=True):
+        pw = nw > 0 and persistent and not ds.streaming
+        return DataLoader(
+            ds, bs, shuffle=shuffle, num_workers=nw,
+            pin_memory=True, collate_fn=collate, drop_last=drop_last,
+            prefetch_factor=pf, persistent_workers=pw,
+        )
 
     opt = optim.AdamW(model.parameters(), lr=args.lr)
 
-    loader = DataLoader(train_ds, bs, shuffle=True, num_workers=nw,
-                        pin_memory=True, collate_fn=collate, drop_last=True,
-                        prefetch_factor=pf, persistent_workers=nw > 0)
-    val_loader = DataLoader(val_ds, bs, shuffle=False, num_workers=nw,
-                             pin_memory=True, collate_fn=collate,
-                             prefetch_factor=pf, persistent_workers=nw > 0)
+    loader = make_loader(train_ds)
+    val_loader = make_loader(val_ds, shuffle=False, drop_last=False)
 
     steps_ep = max(1, len(loader) // ga)
-    sched = build_cosine_schedule(opt, args.epochs * steps_ep,
-                                   int(args.epochs * steps_ep * args.warmup_ratio))
+    sched = build_cosine_schedule(
+        opt, args.epochs * steps_ep,
+        int(args.epochs * steps_ep * args.warmup_ratio)
+    )
 
-    for ep in range(1, args.epochs + 1):
+    # Save run metadata
+    config = {
+        "model": args.model,
+        "params_M": round(total_params / 1e6, 2),
+        "epochs": args.epochs,
+        "batch_size": bs,
+        "grad_accum_steps": ga,
+        "effective_batch": bs * ga,
+        "lr": args.lr,
+        "warmup_ratio": args.warmup_ratio,
+        "scheduler": "cosine",
+        "total_steps": args.epochs * steps_ep,
+        "warmup_steps": int(args.epochs * steps_ep * args.warmup_ratio),
+        "steps_per_epoch": steps_ep,
+        "mask_prob": args.mask_prob,
+        "trie_dropout": args.trie_dropout,
+        "max_tokens": args.max_tokens,
+        "vocab_size": tokenizer.vocab_size,
+        "tokenizer": args.tokenizer,
+        "seed": args.seed,
+        "amp": amp,
+        "shards_per_epoch": args.shards_per_epoch,
+        "streaming": train_ds.streaming,
+        "total_train_shards": len(train_ds._shard_paths) if train_ds.streaming else None,
+        "train_samples": len(train_ds),
+        "val_samples": len(val_ds),
+    }
+    with open(ckpt_mgr.run_dir / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
+    save_environment(ckpt_mgr.run_dir)
+    save_model_arch(ckpt_mgr.run_dir, model)
+    log.info("Run directory: %s", ckpt_mgr.run_dir)
+
+    # Resume from checkpoint
+    start_epoch = 1
+    if args.checkpoint:
+        ckpt = ckpt_mgr.load(args.checkpoint, model, opt, sched, map_location=device)
+        start_epoch = ckpt.get("epoch", 0) + 1
+        log.info("Resumed from %s (epoch %d, best_val=%.4f)",
+                 args.checkpoint, start_epoch - 1, ckpt_mgr.best_val_loss)
+
+    global_step = (start_epoch - 1) * max(1, len(loader) // ga)
+    for ep in range(start_epoch, args.epochs + 1):
+        # Rotate shards if streaming (must recreate loader for worker visibility)
+        if train_ds.streaming:
+            train_ds.load_epoch(ep)
+            loader = make_loader(train_ds)
+
+        # --- Train ---
+        t0 = time.time()
         model.train()
         opt.zero_grad(set_to_none=True)
-        losses, accs, n = 0.0, 0.0, 0
-        for i, batch in enumerate(tqdm(loader, desc=f"Epoch {ep}", leave=False)):
+        losses, accs = 0.0, 0.0
+        pbar = tqdm(loader, desc=f"Epoch {ep}", leave=False)
+        for i, batch in enumerate(pbar):
             try:
                 m = train_step(batch, model, device, amp, ga)
+            
             except RuntimeError as e:
                 if _is_oom(e):
                     torch.cuda.empty_cache()
                     opt.zero_grad(set_to_none=True)
                     continue
                 raise
+            
             losses += m["loss"].item()
             accs += m["acc"].item()
-            n += 1
+            pbar.set_postfix(loss=f"{losses/(i+1):.3f}", acc=f"{accs/(i+1):.1%}")
+            
             if (i + 1) % ga == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                 opt.step()
                 sched.step()
                 opt.zero_grad(set_to_none=True)
+                global_step += 1
 
-        # Validation
-        model.eval()
-        vl, va, vn = 0.0, 0.0, 0
-        for batch in val_loader:
-            vm = eval_step(batch, model, device, amp)
-            vl += vm["loss"].item()
-            va += vm["acc"].item()
-            vn += 1
+        train_elapsed = time.time() - t0
+        current_lr = sched.get_last_lr()[0]
+        train_loss = losses / max(1, len(loader))
+        train_acc = accs / max(1, len(loader))
+        t_metrics = {"loss": train_loss, "acc": train_acc}
 
-        log.info("Epoch %d/%d loss=%.4f acc=%.4f | val_loss=%.4f val_acc=%.4f",
-                 ep, args.epochs, losses / max(n, 1), accs / max(n, 1),
-                 vl / max(vn, 1), va / max(vn, 1))
-        ckpt_mgr.save(model, opt, sched, ep, val_loss=vl / max(vn, 1))
+        # --- Validation ---
+        v_metrics = None
+        val_elapsed = 0.0
+        if ep % args.val_every == 0 or ep == args.epochs:
+            t1 = time.time()
+            model.eval()
+            vl, va = 0.0, 0.0
+            for batch in val_loader:
+                vm = eval_step(batch, model, device, amp)
+                vl += vm["loss"].item()
+                va += vm["acc"].item()
+            val_elapsed = time.time() - t1
+            v_metrics = {
+                "loss": vl / max(1, len(val_loader)),
+                "acc": va / max(1, len(val_loader)),
+            }
+
+        # Log
+        msg = f"Epoch {ep:2d}/{args.epochs:2d} [train {train_elapsed:.0f}s"
+        if v_metrics:
+            msg += f" | val {val_elapsed:.0f}s"
+        msg += f"] loss={train_loss:.4f} acc={train_acc:.4f}"
+        if v_metrics:
+            msg += f" | val_loss={v_metrics['loss']:.4f} val_acc={v_metrics['acc']:.4f}"
+        log.info(msg)
+
+        # Save checkpoint + metrics
+        ckpt_mgr.save(
+            model, opt, sched, ep, global_step=global_step,
+            train_metrics=t_metrics, val_metrics=v_metrics,
+            lr=current_lr, train_elapsed_s=train_elapsed,
+            val_elapsed_s=val_elapsed,
+        )
 
     log.info("=" * 50)
     log.info("MLM pretraining complete. Best val loss: %.4f (epoch %d)",
-             ckpt_mgr.state.best_val_loss, ckpt_mgr.state.best_epoch)
-    log.info("Checkpoints: %s", ckpt_mgr.models_dir)
+             ckpt_mgr.best_val_loss, ckpt_mgr.best_epoch)
+    log.info("Checkpoints: %s", ckpt_mgr.phase_dir)
 
 
 if __name__ == "__main__":
