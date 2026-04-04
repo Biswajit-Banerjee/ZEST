@@ -160,10 +160,12 @@ class TraitEncoder(nn.Module):
 def create_trait_encoder(preset: str, vocab_size: int = 32000, max_tokens: int = 1024) -> TraitEncoder:
     """Create a TraitEncoder model from a named preset."""
     presets = {
-        "base": dict(embed_dim=384, num_layers=8, nhead=6, proj_dim=128, dropout=0.1),
-        "efficient-deep": dict(embed_dim=512, num_layers=16, nhead=8, proj_dim=128,
-                               dropout=0.08, num_proj_layers=3),
-        "deep-wide": dict(embed_dim=768, num_layers=24, nhead=12, proj_dim=384, dropout=0.05),
+        # ~32.1M params (core=30.0M, projector=0.9M, aggregator=0.7M)
+        "test": dict(embed_dim=384, num_layers=10, nhead=6,  proj_dim=64,  dropout=0.10, num_proj_layers=2, ff_mult=4, proj_ff_mult=2),
+        # ~74.7M params (core=66.7M, projector=6.4M, aggregator=1.3M)
+        "base": dict(embed_dim=512, num_layers=16, nhead=8,  proj_dim=128, dropout=0.08, num_proj_layers=3, ff_mult=4, proj_ff_mult=4),
+        # ~217.3M params (core=194.5M, projector=19.2M, aggregator=3.0M)
+        "deep": dict(embed_dim=768, num_layers=24, nhead=12, proj_dim=384, dropout=0.04, num_proj_layers=4, ff_mult=4, proj_ff_mult=4),
     }
     if preset not in presets:
         raise ValueError(f"Unknown preset '{preset}'. Choose from: {list(presets.keys())}")
