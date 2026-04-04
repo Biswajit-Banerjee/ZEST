@@ -27,7 +27,7 @@ task labels. Higher τ = more informative tokenization = better scaling.
 ```
 zest/                          # Shared library
   model/                       # Transformer encoder, pruning, presets
-  tokenizer.py                 # ZEST: Zoned Encoding of Sequence Traits
+  tokenizer.py                 # ZEST: Zoned Encoding of Sequence Themes
   data/                        # Pretrain (MPM) + fine-tune (hierarchical pairs)
   training/                    # Pretrain + contrastive fine-tune pipelines
   evaluation/                  # Retrieval benchmarks

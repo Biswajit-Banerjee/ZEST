@@ -1,5 +1,5 @@
 """
-Token-level MLM pretraining for TraitEncoder.
+Token-level MLM pretraining for ThemeEncoder.
 
 Usage:
     python -m zest.training.pretrain --model efficient-deep --epochs 8
@@ -15,7 +15,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from zest.model.trait_encoder import create_trait_encoder
+from zest.model.theme_encoder import create_theme_encoder
 from zest.tokenizer import ZESTTokenizer
 from zest.data.pretrain import PretrainDataset, pretrain_collate_fn
 from zest.training.utils import (
@@ -76,7 +76,7 @@ def eval_step(batch, model, device, amp):
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="TraitEncoder MLM pretraining")
+    p = argparse.ArgumentParser(description="ThemeEncoder MLM pretraining")
     p.add_argument("--model", default="base", choices=["base", "efficient-deep", "deep-wide"])
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--batch-size", type=int, default=128)
@@ -111,7 +111,7 @@ def main():
             torch.backends.cuda.matmul.allow_tf32 = True
             amp = True
 
-    ckpt_mgr = CheckpointManager(args.output_dir, "trait_encoder_mlm", args.model, "mlm",
+    ckpt_mgr = CheckpointManager(args.output_dir, "theme_encoder_mlm", args.model, "mlm",
                                   run_dir=args.run_dir)
     log = setup_logging("pretrain", str(ckpt_mgr.log_path))
 
@@ -127,7 +127,7 @@ def main():
     collate = lambda b: pretrain_collate_fn(
         b, tokenizer.pad_id, tokenizer.mask_id, tokenizer.vocab_size, args.mask_prob)
 
-    model = create_trait_encoder(args.model, tokenizer.vocab_size, args.max_tokens).to(device)
+    model = create_theme_encoder(args.model, tokenizer.vocab_size, args.max_tokens).to(device)
     if args.checkpoint:
         log.info("Loading checkpoint: %s", args.checkpoint)
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)

@@ -1,8 +1,8 @@
 """
-ZEST Tokenizer: Zoned Encoding of Sequence Traits.
+ZEST Tokenizer: Zoned Encoding of Sequence Themes.
 
 A domain-aware tokenizer that uses greedy max-match over a trie of
-recurring patterns (traits) mined from domain data. Long patterns are
+recurring patterns mined from domain data. Long patterns are
 prioritized while unmatched regions fall back to base alphabet characters.
 """
 import json

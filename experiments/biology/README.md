@@ -49,7 +49,7 @@ Already computed:
 ```bash
 # Prune and fine-tune
 python experiments/biology/prune_and_finetune.py \
-    --checkpoint data/checkpoints/trait_encoder_70M_mpm.pth \
+    --checkpoint data/checkpoints/theme_encoder_70M_mpm.pth \
     --layer-counts 4 8 16 \
     --strategy uniform
 
@@ -60,6 +60,6 @@ python experiments/biology/compute_tau.py \
 
 # Benchmark
 python -m zest.evaluation.benchmark \
-    --checkpoint outputs/biology/4L/models/trait_encoder_hier_best.pth \
+    --checkpoint outputs/biology/4L/models/theme_encoder_hier_best.pth \
     --retrieval-fasta data/astral-scopedom-seqres-gd-sel-gs-bib-40-2.08.fa
 ```

@@ -1,5 +1,5 @@
 """
-TraitEncoder.
+ThemeEncoder.
 Two-stage encoder model:
   1. Masked Language Modeling (MLM)
   2. Hierarchical contrastive fine-tuning
@@ -16,7 +16,7 @@ from zest.model.pooling import AttentionAggregator
 
 _log = logging.getLogger(__name__)
 
-class TraitEncoder(nn.Module):
+class ThemeEncoder(nn.Module):
 
     def __init__(
         self,
@@ -157,8 +157,8 @@ class TraitEncoder(nn.Module):
 # Model presets
 # ---------------------------------------------------------------------------
 
-def create_trait_encoder(preset: str, vocab_size: int = 32000, max_tokens: int = 1024) -> TraitEncoder:
-    """Create a TraitEncoder model from a named preset."""
+def create_theme_encoder(preset: str, vocab_size: int = 32000, max_tokens: int = 1024) -> ThemeEncoder:
+    """Create a ThemeEncoder model from a named preset."""
     presets = {
         # ~32.1M params (core=30.0M, projector=0.9M, aggregator=0.7M)
         "test": dict(embed_dim=384, num_layers=10, nhead=6,  proj_dim=64,  dropout=0.10, num_proj_layers=2, ff_mult=4, proj_ff_mult=2),
@@ -169,4 +169,4 @@ def create_trait_encoder(preset: str, vocab_size: int = 32000, max_tokens: int =
     }
     if preset not in presets:
         raise ValueError(f"Unknown preset '{preset}'. Choose from: {list(presets.keys())}")
-    return TraitEncoder(vocab_size=vocab_size, max_tokens=max_tokens, **presets[preset])
+    return ThemeEncoder(vocab_size=vocab_size, max_tokens=max_tokens, **presets[preset])

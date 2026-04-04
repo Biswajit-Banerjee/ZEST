@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from zest.model.trait_encoder import TraitEncoder
+from zest.model.theme_encoder import ThemeEncoder
 from zest.tokenizer import ZESTTokenizer
 
 
@@ -296,7 +296,7 @@ def save_results(checkpoint_path: str, all_output: Dict, ckpt_name: str):
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="TraitEncoder retrieval benchmark")
+    p = argparse.ArgumentParser(description="ThemeEncoder retrieval benchmark")
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--tokenizer", default=TOKENIZER_PATH)
     p.add_argument("--retrieval-fasta", nargs="+", default=[])
@@ -321,7 +321,7 @@ def main():
         sys.exit(1)
 
     tokenizer = ZESTTokenizer(args.tokenizer)
-    model, _ = TraitEncoder.load_pretrained(args.checkpoint, device="cpu")
+    model, _ = ThemeEncoder.load_pretrained(args.checkpoint, device="cpu")
     model = model.to(device)
     ckpt_name = Path(args.checkpoint).stem
 

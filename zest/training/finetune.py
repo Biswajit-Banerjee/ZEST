@@ -1,7 +1,7 @@
 """
-Hierarchical contrastive fine-tuning for TraitEncoder.
+Hierarchical contrastive fine-tuning for ThemeEncoder.
 
-Trains a pretrained TraitEncoder model on CATH structural pairs using three
+Trains a pretrained ThemeEncoder model on CATH structural pairs using three
 complementary losses at Architecture (A), Topology (T), and Homologous
 Superfamily (H) levels:
 
@@ -27,7 +27,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from zest.model.trait_encoder import TraitEncoder
+from zest.model.theme_encoder import ThemeEncoder
 from zest.tokenizer import ZESTTokenizer
 from zest.data.finetune import HierarchicalPairDataset, finetune_collate_fn
 from zest.training.utils import (
@@ -498,7 +498,7 @@ def main():
     if args.proj_ff_mult is not None:
         overrides["proj_ff_mult"] = args.proj_ff_mult
 
-    model, ckpt = TraitEncoder.load_pretrained(args.checkpoint, device="cpu", **overrides)
+    model, ckpt = ThemeEncoder.load_pretrained(args.checkpoint, device="cpu", **overrides)
     model = model.to(device)
 
     # Start fully frozen, then selectively unfreeze below
@@ -531,7 +531,7 @@ def main():
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    ckpt_mgr = CheckpointManager(args.output_dir, "trait_encoder_hier", "finetune", "hier",
+    ckpt_mgr = CheckpointManager(args.output_dir, "theme_encoder_hier", "finetune", "hier",
                                   run_dir=args.run_dir)
     log = setup_logging("finetune", str(ckpt_mgr.log_path))
     log.info("Model: %.1fM total, %.1fM trainable (%.1f%%)",
