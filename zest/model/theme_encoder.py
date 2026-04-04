@@ -35,40 +35,38 @@ class ThemeEncoder(nn.Module):
     ):
         super().__init__()
 
-        self.core = Encoder(
-            vocab_size=vocab_size, embed_dim=embed_dim, num_layers=num_layers,
-            nhead=nhead, ff_mult=ff_mult, dropout=dropout, max_tokens=max_tokens,
-            padding_idx=padding_idx, rope_scaling_type=rope_scaling_type,
-        )
+        self.vocab_size = vocab_size
         self.max_tokens = max_tokens
-
-        # to train MLM on token level
-        self.token_mlm_proj = self.bottleneck_mlp(embed_dim, embed_dim//2, dropout, 1, output_dim=None)
-
-        # Similarity components
+        self.embed_dim = embed_dim
         self.proj_dim = proj_dim or embed_dim
-        self.temperature = nn.Parameter(torch.ones(1) * 0.07)
-        self.aggregator = AttentionAggregator(embed_dim, dropout=dropout)
-
-        # Projector: bottleneck MLP
         self.num_proj_layers = num_proj_layers
         self.proj_ff_mult = proj_ff_mult
-        hidden = embed_dim * proj_ff_mult
-        self.projector = self.bottleneck_mlp(embed_dim, hidden, dropout, self.num_proj_layers, output_dim=self.proj_dim) 
+
+        
+        self.core = Encoder(
+            vocab_size=self.vocab_size, embed_dim=self.embed_dim, num_layers=num_layers,
+            nhead=nhead, ff_mult=ff_mult, dropout=dropout, max_tokens=self.max_tokens,
+            padding_idx=padding_idx, rope_scaling_type=rope_scaling_type,
+        )
+
+        # Similarity components
+        self.temperature = nn.Parameter(torch.ones(1) * 0.07)
+        self.aggregator = AttentionAggregator(self.embed_dim, dropout=dropout)
+
+        # Projector: bottleneck MLP
+        hidden = self.embed_dim * self.proj_ff_mult
+        self.projector = self.bottleneck_mlp(self.embed_dim, hidden, dropout, self.num_proj_layers, output_dim=self.proj_dim) 
         
         self.config = {
-            "vocab_size": vocab_size, "embed_dim": embed_dim,
+            "vocab_size": self.vocab_size, "embed_dim": self.embed_dim,
             "num_layers": num_layers, "nhead": nhead, "ff_mult": ff_mult,
-            "dropout": dropout, "max_tokens": max_tokens,
+            "dropout": dropout, "max_tokens": self.max_tokens,
             "proj_dim": self.proj_dim,
             "padding_idx": padding_idx,
             "rope_scaling_type": rope_scaling_type,
             "num_proj_layers": num_proj_layers, "proj_ff_mult": proj_ff_mult,
         }
 
-    # ------------------------------------------------------------------
-    # Core forward methods
-    # ------------------------------------------------------------------
     def bottleneck_mlp(self, input_dim, hidden, dropout, num_proj_layers, output_dim=None):
         layers = []
         
@@ -112,8 +110,7 @@ class ThemeEncoder(nn.Module):
     def forward(self, tokens, mask=None):
         """Default forward: token-level MLM with tied input embedding weights."""
         token_embs = self.encode_tokens(tokens, mask)
-        h = self.token_mlm_proj(token_embs)
-        return F.linear(h, self.core.token_emb.weight)
+        return F.linear(token_embs, self.core.token_emb.weight)
 
     def freeze_core(self):
         for p in self.core.parameters():
