@@ -205,6 +205,7 @@ cython_debug/
 
 # Data directories
 data/protein/*
+outputs/
 
 # Marimo
 marimo/_static/
