@@ -6,6 +6,7 @@ Usage:
 """
 import argparse
 import json
+import math
 import random
 import time
 from pathlib import Path
@@ -243,7 +244,12 @@ def main():
                     continue
                 raise
             
-            losses += m["loss"].item()
+            step_loss = m["loss"].item()
+            if math.isnan(step_loss):
+                opt.zero_grad(set_to_none=True)
+                continue
+
+            losses += step_loss
             accs += m["acc"].item()
             pbar.set_postfix(loss=f"{losses/(i+1):.3f}", acc=f"{accs/(i+1):.1%}")
             
@@ -266,15 +272,22 @@ def main():
         if ep % args.val_every == 0 or ep == args.epochs:
             t1 = time.time()
             model.eval()
-            vl, va = 0.0, 0.0
+            vl, va, vn = 0.0, 0.0, 0
             for batch in val_loader:
-                vm = eval_step(batch, model, device, amp)
+                try:
+                    vm = eval_step(batch, model, device, amp)
+                except RuntimeError as e:
+                    if _is_oom(e):
+                        torch.cuda.empty_cache()
+                        continue
+                    raise
                 vl += vm["loss"].item()
                 va += vm["acc"].item()
+                vn += 1
             val_elapsed = time.time() - t1
             v_metrics = {
-                "loss": vl / max(1, len(val_loader)),
-                "acc": va / max(1, len(val_loader)),
+                "loss": vl / max(1, vn),
+                "acc": va / max(1, vn),
             }
 
         # Log
