@@ -41,8 +41,11 @@ def save_environment(run_dir: Union[str, Path]):
         "cuda": torch.version.cuda or "N/A",
         "cudnn": str(torch.backends.cudnn.version()) if torch.backends.cudnn.is_available() else "N/A",
         "num_gpus": torch.cuda.device_count(),
-        "gpus": [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
     }
+    try:
+        info["gpus"] = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+    except RuntimeError:
+        info["gpus"] = ["unavailable (CUDA init failed)"]
     # Find the repo root relative to this source file
     _repo = str(Path(__file__).resolve().parent.parent.parent)
     try:
@@ -90,11 +93,12 @@ class CheckpointManager:
                 best.pth    -> epoch_1.pth  (symlink)
             finetune/
                 ...
-            config.json
             pretrain.log
             finetune.log
-            pretrain_metrics.json
-            finetune_metrics.json
+            metrics/
+                pretrain.json
+                finetune.json
+            config.json
             model_arch.json
             environment.json
     """
@@ -106,10 +110,12 @@ class CheckpointManager:
         self.phase_dir = self.run_dir / phase
         self.keep_last_n = keep_last_n
         self.log_path = self.run_dir / f"{phase}.log"
-        self.metrics_path = self.run_dir / f"{phase}_metrics.json"
+        self.metrics_dir = self.run_dir / "metrics"
+        self.metrics_path = self.metrics_dir / f"{phase}.json"
 
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.phase_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_dir.mkdir(parents=True, exist_ok=True)
 
         self.best_val_loss: float = float("inf")
         self.best_epoch: int = 0
@@ -335,16 +341,22 @@ def build_llrd_param_groups(model, base_lr: float, head_lr: float,
 # ---------------------------------------------------------------------------
 
 def setup_logging(name: str = "training", log_file: Optional[str] = None) -> logging.Logger:
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
-    ch = logging.StreamHandler()
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
-    if log_file:
+
+    # Configure root logger so library modules (e.g. zest.data.*) are visible
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    if not root.handlers:
+        ch = logging.StreamHandler()
+        ch.setFormatter(fmt)
+        root.addHandler(ch)
+    if log_file and not any(isinstance(h, logging.FileHandler) for h in root.handlers):
         fh = logging.FileHandler(log_file)
         fh.setFormatter(fmt)
-        logger.addHandler(fh)
+        root.addHandler(fh)
+
+    # Return a named logger for the caller
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
     return logger

@@ -95,6 +95,9 @@ def parse_args():
     p.add_argument("--checkpoint",       default=None,                 help="Resume from checkpoint (infers run-dir)")
     p.add_argument("--amp",              action="store_true",          help="Use automatic mixed precision")
     p.add_argument("--keep-all-checkpoints", action="store_true",      help="Keep all checkpoints (default: last 3)")
+    p.add_argument("--domain",           default="protein", choices=["protein", "code"], help="Data domain")
+    p.add_argument("--ast-language",     default="python",             help="Language for AST encoder (code domain only)")
+    p.add_argument("--seq-column",       default="sequence",           help="Column name for sequences in parquet")
     
     return p.parse_args()
 
@@ -106,6 +109,8 @@ def seed_everything(seed: int):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cuda.enable_flash_sdp(False)
 
 
 def main():
@@ -134,17 +139,32 @@ def main():
 
     tokenizer = ZESTTokenizer(args.tokenizer)
 
+    # Build domain-specific encoder (code: lexer, protein: None)
+    encoder = None
+    lang_column = None
+    if args.domain == "code":
+        from experiments.code.build_role_tokenizer import make_multilang_role_encoder
+        encoder = make_multilang_role_encoder()
+        lang_column = "language"
+        log.info("Code domain: multi-language role encoder (dropout=%.2f)", args.trie_dropout)
+
     train_ds = MLMDataset(
         args.train_data, tokenizer,
         is_training=True,
         max_tokens=args.max_tokens, trie_dropout=args.trie_dropout,
         shards_per_epoch=args.shards_per_epoch,
         unique_shards=args.unique_shards, seed=args.seed,
+        seq_column=args.seq_column,
+        lang_column=lang_column,
+        encoder=encoder,
     )
     val_ds = MLMDataset(
         args.val_data, tokenizer,
         is_training=False,
         max_tokens=args.max_tokens,
+        seq_column=args.seq_column,
+        lang_column=lang_column,
+        encoder=encoder,
     )
 
     collate = lambda b: mlm_collate_fn(

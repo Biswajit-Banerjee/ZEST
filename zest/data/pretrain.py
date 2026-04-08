@@ -41,16 +41,21 @@ class MLMDataset(Dataset):
                  max_tokens: Optional[int] = None,
                  trie_dropout: float = 0.0,
                  seq_column: str = "sequence",
+                 lang_column: Optional[str] = None,
                  shards_per_epoch: Optional[int] = None,
                  unique_shards: bool = False,
-                 seed: int = 42):
+                 seed: int = 42,
+                 encoder: Optional[callable] = None):
         self.tokenizer = tokenizer
         self.is_training = is_training
         self.max_tokens = max_tokens
         self.trie_dropout = trie_dropout
         self._seq_column = seq_column
+        self._lang_column = lang_column
         self._seed = seed
         self._unique = unique_shards
+        self._encoder = encoder
+        self._langs: Optional[List[str]] = None
 
         # Discover parquet shards
         self._shard_paths: List[str] = []
@@ -80,9 +85,27 @@ class MLMDataset(Dataset):
                           len(self._shard_paths), shards_per_epoch, data_path)
             self._seqs: List[str] = []
             self.load_epoch(0)
+        elif self._shard_paths and self._lang_column:
+            self._seqs, self._langs = self._load_all_parquet_with_lang()
+            _log.info("MLMDataset: %d sequences (with language) from %s", len(self._seqs), data_path)
         else:
             self._seqs = load_sequences(data_path, seq_column)
             _log.info("MLMDataset: %d sequences from %s", len(self._seqs), data_path)
+
+    def _load_all_parquet_with_lang(self):
+        """Load all parquet shards, returning (seqs, langs) lists."""
+        seqs, langs = [], []
+        for path in self._shard_paths:
+            df = pd.read_parquet(path)
+            col = self._seq_column
+            for c in [col, "raw_sequence", "sequence", "text", "code"]:
+                if c in df.columns:
+                    col = c
+                    break
+            seqs.extend(df[col].tolist())
+            if self._lang_column in df.columns:
+                langs.extend(df[self._lang_column].tolist())
+        return seqs, langs if langs else None
 
     @property
     def num_epochs_for_full_pass(self) -> Optional[int]:
@@ -103,6 +126,7 @@ class MLMDataset(Dataset):
             selected = rng.sample(self._shard_paths, n)
 
         seqs: List[str] = []
+        langs: List[str] = [] if self._lang_column else None
         for path in selected:
             df = pd.read_parquet(path)
             col = self._seq_column
@@ -111,7 +135,10 @@ class MLMDataset(Dataset):
                     col = c
                     break
             seqs.extend(df[col].tolist())
+            if langs is not None and self._lang_column in df.columns:
+                langs.extend(df[self._lang_column].tolist())
         self._seqs = seqs
+        self._langs = langs
         _log.info("Epoch %d: loaded %d shards (%d sequences)", epoch, len(selected), len(self._seqs))
 
     def __len__(self) -> int:
@@ -119,7 +146,15 @@ class MLMDataset(Dataset):
 
     def __getitem__(self, idx: int):
         dropout = self.trie_dropout if self.is_training else 0.0
-        ids = self.tokenizer.encode(self._seqs[idx], dropout=dropout)
+        if self._encoder is not None and self._langs is not None:
+            # Multi-lang encoder: wrap it so tokenizer handles str→id conversion
+            lang = self._langs[idx]
+            enc_fn = lambda src: self._encoder(src, lang)
+            ids = self.tokenizer.encode(self._seqs[idx], dropout=dropout,
+                                        encoder=enc_fn)
+        else:
+            ids = self.tokenizer.encode(self._seqs[idx], dropout=dropout,
+                                        encoder=self._encoder)
         if self.max_tokens and len(ids) > self.max_tokens:
             ids = ids[:self.max_tokens]
         return {"input_ids": torch.tensor(ids, dtype=torch.long)}
