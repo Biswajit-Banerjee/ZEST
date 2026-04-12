@@ -28,7 +28,7 @@ from zest.tokenizer import ZESTTokenizer
 
 DEFAULT_BATCH_SIZE = 256
 DEFAULT_MAX_TOKENS = 1024
-TOKENIZER_PATH = "data/tokens.json"
+TOKENIZER_PATH = "data/tokens/tedlh_zest_32K.json"
 
 
 # ---------------------------------------------------------------------------
@@ -41,15 +41,18 @@ def encode_sequences(model, tokenizer, sequences: List[str],
                      device: torch.device) -> np.ndarray:
     """Encode sequences into L2-normalised embeddings."""
     model.eval()
+    pad_id = tokenizer.pad_id
     all_embs = []
     for start in tqdm(range(0, len(sequences), batch_size), desc="Encoding", leave=False):
-        batch = sequences[start:start + batch_size]
-        inputs = tokenizer.batch_encode_plus(
-            batch, padding=True, max_length=max_tokens,
-            truncation=True, return_tensors="pt",
-        )
-        ids = inputs["input_ids"].to(device)
-        mask = inputs["attention_mask"].to(device)
+        batch_seqs = sequences[start:start + batch_size]
+        encoded = [tokenizer.encode(s)[:max_tokens] for s in batch_seqs]
+        max_len = max(len(e) for e in encoded)
+        ids = torch.full((len(encoded), max_len), pad_id, dtype=torch.long)
+        mask = torch.zeros(len(encoded), max_len, dtype=torch.long)
+        for i, e in enumerate(encoded):
+            ids[i, :len(e)] = torch.tensor(e, dtype=torch.long)
+            mask[i, :len(e)] = 1
+        ids, mask = ids.to(device), mask.to(device)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             emb = model.project_family(ids, mask, normalize=True)
         all_embs.append(emb.float().cpu().numpy())
@@ -299,6 +302,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="ThemeEncoder retrieval benchmark")
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--tokenizer", default=TOKENIZER_PATH)
+    p.add_argument("--tokenizer-type", default="zest", choices=["zest", "bpe", "char"])
     p.add_argument("--retrieval-fasta", nargs="+", default=[])
     p.add_argument("--scope-fasta", default=None)
     p.add_argument("--cath-domain-list", default=None)
@@ -320,7 +324,14 @@ def main():
         print("No FASTA files provided. Use --retrieval-fasta or --scope-fasta.")
         sys.exit(1)
 
-    tokenizer = ZESTTokenizer(args.tokenizer)
+    if args.tokenizer_type == "bpe":
+        from experiments.biology.build_protein_bpe_tokenizer import ProteinBPETokenizer
+        tokenizer = ProteinBPETokenizer(args.tokenizer)
+    elif args.tokenizer_type == "char":
+        from experiments.biology.char_tokenizer import CharTokenizer
+        tokenizer = CharTokenizer()
+    else:
+        tokenizer = ZESTTokenizer(args.tokenizer)
     model, _ = ThemeEncoder.load_pretrained(args.checkpoint, device="cpu")
     model = model.to(device)
     ckpt_name = Path(args.checkpoint).stem

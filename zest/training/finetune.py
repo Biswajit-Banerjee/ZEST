@@ -120,6 +120,7 @@ def parse_args():
     p.add_argument("--proj-ff-mult",     type=int, default=None)
     p.add_argument("--domain",           default="protein", choices=["protein", "code"], help="Data domain")
     p.add_argument("--ast-language",     default="cpp",              help="Language for AST encoder (code domain only)")
+    p.add_argument("--tokenizer-type",   default="zest", choices=["zest", "bpe", "char"], help="Tokenizer type (zest=trie, bpe=subword baseline, char=character-level)")
     return p.parse_args()
 
 
@@ -193,17 +194,36 @@ def main():
 
     # Tokenizer + data
     log.info("Loading tokenizer and training data from %s ...", args.shards_dir)
-    tokenizer = ZESTTokenizer(args.tokenizer)
+    if args.tokenizer_type == "bpe":
+        if args.domain == "code":
+            from experiments.code.build_bpe_tokenizer import CodeBPETokenizer
+            tokenizer = CodeBPETokenizer(args.tokenizer)
+        else:
+            from experiments.biology.build_protein_bpe_tokenizer import ProteinBPETokenizer
+            tokenizer = ProteinBPETokenizer(args.tokenizer)
+        log.info("Using BPE tokenizer: vocab_size=%d", tokenizer.vocab_size)
+    elif args.tokenizer_type == "char":
+        from experiments.biology.char_tokenizer import CharTokenizer
+        tokenizer = CharTokenizer()
+        log.info("Using char tokenizer: vocab_size=%d", tokenizer.vocab_size)
+    else:
+        tokenizer = ZESTTokenizer(args.tokenizer)
 
     # Build domain-specific encoder for code
     encoder = None
-    encoder_cfg = None
+    encoder_cfg = {"tokenizer_type": args.tokenizer_type, "domain": args.domain}
     if args.domain == "code":
-        from experiments.code.build_role_tokenizer import make_role_encoder
-        encoder = make_role_encoder(args.ast_language)
-        encoder_cfg = {"language": args.ast_language, "dropout": args.bpe_dropout}
-        log.info("Code domain: role encoder for %s (dropout=%.2f)",
-                 args.ast_language, args.bpe_dropout)
+        if args.tokenizer_type == "bpe":
+            from experiments.code.build_bpe_tokenizer import make_bpe_encoder
+            encoder = make_bpe_encoder(args.tokenizer, args.ast_language)
+            encoder_cfg.update({"language": args.ast_language})
+            log.info("Code domain: BPE encoder for %s (comment-stripped)", args.ast_language)
+        else:
+            from experiments.code.build_role_tokenizer import make_role_encoder
+            encoder = make_role_encoder(args.ast_language)
+            encoder_cfg.update({"language": args.ast_language, "dropout": args.bpe_dropout})
+            log.info("Code domain: role encoder for %s (dropout=%.2f)",
+                     args.ast_language, args.bpe_dropout)
 
     train_ds = HierarchicalPairDataset(
         args.shards_dir, tokenizer, max_tokens=args.max_tokens,

@@ -98,6 +98,7 @@ def parse_args():
     p.add_argument("--domain",           default="protein", choices=["protein", "code"], help="Data domain")
     p.add_argument("--ast-language",     default="python",             help="Language for AST encoder (code domain only)")
     p.add_argument("--seq-column",       default="sequence",           help="Column name for sequences in parquet")
+    p.add_argument("--tokenizer-type",   default="zest", choices=["zest", "bpe", "char"], help="Tokenizer type (zest=trie, bpe=subword baseline, char=character-level)")
     
     return p.parse_args()
 
@@ -109,8 +110,8 @@ def seed_everything(seed: int):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 
 def main():
@@ -137,16 +138,34 @@ def main():
     ckpt_mgr = CheckpointManager(run_dir, phase="pretrain", keep_last_n=keep_n)
     log = setup_logging("pretrain", str(ckpt_mgr.log_path))
 
-    tokenizer = ZESTTokenizer(args.tokenizer)
+    if args.tokenizer_type == "bpe":
+        if args.domain == "code":
+            from experiments.code.build_bpe_tokenizer import CodeBPETokenizer
+            tokenizer = CodeBPETokenizer(args.tokenizer)
+        else:
+            from experiments.biology.build_protein_bpe_tokenizer import ProteinBPETokenizer
+            tokenizer = ProteinBPETokenizer(args.tokenizer)
+        log.info("Using BPE tokenizer: vocab_size=%d", tokenizer.vocab_size)
+    elif args.tokenizer_type == "char":
+        from experiments.biology.char_tokenizer import CharTokenizer
+        tokenizer = CharTokenizer()
+        log.info("Using char tokenizer: vocab_size=%d", tokenizer.vocab_size)
+    else:
+        tokenizer = ZESTTokenizer(args.tokenizer)
 
-    # Build domain-specific encoder (code: lexer, protein: None)
+    # Build domain-specific encoder (code: role/BPE, protein: None)
     encoder = None
     lang_column = None
     if args.domain == "code":
-        from experiments.code.build_role_tokenizer import make_multilang_role_encoder
-        encoder = make_multilang_role_encoder()
+        if args.tokenizer_type == "bpe":
+            from experiments.code.build_bpe_tokenizer import make_multilang_bpe_encoder
+            encoder = make_multilang_bpe_encoder(args.tokenizer)
+            log.info("Code domain: BPE encoder (comment-stripped)")
+        else:
+            from experiments.code.build_role_tokenizer import make_multilang_role_encoder
+            encoder = make_multilang_role_encoder()
+            log.info("Code domain: multi-language role encoder (dropout=%.2f)", args.trie_dropout)
         lang_column = "language"
-        log.info("Code domain: multi-language role encoder (dropout=%.2f)", args.trie_dropout)
 
     train_ds = MLMDataset(
         args.train_data, tokenizer,
@@ -259,6 +278,7 @@ def main():
             
             except RuntimeError as e:
                 if _is_oom(e):
+                    log.warning("OOM at step %d — skipping batch", i)
                     torch.cuda.empty_cache()
                     opt.zero_grad(set_to_none=True)
                     continue

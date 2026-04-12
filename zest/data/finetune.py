@@ -28,18 +28,41 @@ def _tokenize_chunk(args):
     the trie lives in the child process (no pickle of the full object).
     """
     chunk, tok_path, max_tokens, dropout, seed, encoder_cfg = args
-    from zest.tokenizer import ZESTTokenizer
     random.seed(seed)
-    tok = ZESTTokenizer(tok_path)
-    encoder = None
-    if encoder_cfg is not None:
-        from experiments.code.build_tokenizer import make_ast_encoder
-        encoder = make_ast_encoder(encoder_cfg["language"], tok,
-                                   dropout=encoder_cfg.get("dropout", 0.0))
+
+    cfg = encoder_cfg or {}
+    tok_type = cfg.get("tokenizer_type", "zest")
+    domain = cfg.get("domain", "protein")
+
+    if tok_type == "bpe":
+        if domain == "code":
+            from experiments.code.build_bpe_tokenizer import CodeBPETokenizer, make_bpe_encoder
+            tok = CodeBPETokenizer(tok_path)
+            encoder = make_bpe_encoder(tok_path, cfg.get("language", "c"))
+        else:
+            from experiments.biology.build_protein_bpe_tokenizer import ProteinBPETokenizer
+            tok = ProteinBPETokenizer(tok_path)
+            encoder = None
+    elif tok_type == "char":
+        from experiments.biology.char_tokenizer import CharTokenizer
+        tok = CharTokenizer()
+        encoder = None
+    else:
+        from zest.tokenizer import ZESTTokenizer
+        tok = ZESTTokenizer(tok_path)
+        encoder = None
+        if domain == "code" and "language" in cfg:
+            from experiments.code.build_role_tokenizer import make_role_encoder
+            encoder = make_role_encoder(cfg["language"])
+
     results = []
     for idx, seq in chunk:
         if encoder is not None:
-            ids = encoder(seq)
+            result = encoder(seq)
+            if result and isinstance(result[0], int):
+                ids = result
+            else:
+                ids = tok.encode_symbols(result, dropout=dropout) if hasattr(tok, 'encode_symbols') else tok.encode(seq, dropout=dropout)
         else:
             ids = tok.encode(seq, dropout=dropout)
         if max_tokens and len(ids) > max_tokens:
