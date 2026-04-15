@@ -13,6 +13,8 @@ import torch.nn.functional as F
 
 from zest.model.encoder import Encoder
 from zest.model.pooling import AttentionAggregator
+from zest.model.heads import ProfileExpansionHead
+
 
 _log = logging.getLogger(__name__)
 
@@ -50,8 +52,10 @@ class ThemeEncoder(nn.Module):
         )
 
         # Similarity components
-        self.temperature = nn.Parameter(torch.ones(1) * 0.07)
+        self.log_temperature = nn.Parameter(torch.tensor(0.07).log())
         self.aggregator = AttentionAggregator(self.embed_dim, dropout=dropout)
+        self.profile_expansion_head = ProfileExpansionHead(self.embed_dim, max_residues=3*self.max_tokens)
+        self.global_pos_emb = nn.Embedding(3*self.max_tokens, self.embed_dim)
 
         # Projector: bottleneck MLP
         hidden = self.embed_dim * self.proj_ff_mult
@@ -89,6 +93,11 @@ class ThemeEncoder(nn.Module):
         
         return nn.Sequential(*layers)
         
+    @property
+    def temperature(self) -> torch.Tensor:
+        """Learned temperature, clamped to [0.01, 1.0] for stability."""
+        return self.log_temperature.exp().clamp(min=0.01, max=1.0)
+
     def encode_tokens(self, tokens, mask=None):
         if self._core_is_frozen():
             with torch.no_grad():
@@ -98,19 +107,44 @@ class ThemeEncoder(nn.Module):
     def _core_is_frozen(self) -> bool:
         return not next(self.core.parameters()).requires_grad
 
-    def project_family(self, tokens, mask=None, normalize=True):
-        """Encode tokens → aggregated → projected embedding [B, proj_dim]."""
+    def project_family(self, tokens, mask=None, normalize=True, temperature="learned"):
+        """Encode tokens → aggregated → projected embedding [B, proj_dim].
+
+        Args:
+            temperature: Controls similarity scaling applied to the projection.
+                ``"learned"`` (default) — divide by the model's learned temperature.
+                ``None`` or ``False`` — no temperature scaling.
+                ``float`` — divide by the given manual value.
+        """
         token_embs = self.encode_tokens(tokens, mask)
         family = self.aggregator(token_embs, mask)
         proj = self.projector(family)
         if normalize:
             proj = F.normalize(proj, p=2, dim=-1)
+        proj = self._apply_temperature(proj, temperature)
         return proj
+
+    def _apply_temperature(self, proj, temperature):
+        """Scale projection by 1/temperature when requested."""
+        if temperature is None or temperature is False:
+            return proj
+        if temperature == "learned":
+            return proj / self.temperature
+        return proj / float(temperature)
+
+    def similarity(self, emb_a: torch.Tensor, emb_b: torch.Tensor) -> torch.Tensor:
+        """Temperature-scaled cosine similarity [B_a, B_b]. Inputs should be L2-normalised."""
+        return (emb_a @ emb_b.T) / self.temperature
 
     def forward(self, tokens, mask=None):
         """Default forward: token-level MLM with tied input embedding weights."""
         token_embs = self.encode_tokens(tokens, mask)
         return F.linear(token_embs, self.core.token_emb.weight)
+
+    def forward_residue_mlm(self, tokens, mask, token_lengths, global_indices):
+        """Residue-level MLM: encode → expand to residues → predict AAs [B, L, 20]."""
+        z = self.encode_tokens(tokens, mask)
+        return self.profile_expansion_head(z, token_lengths, global_indices, self.global_pos_emb)
 
     def freeze_core(self):
         for p in self.core.parameters():
@@ -157,13 +191,15 @@ class ThemeEncoder(nn.Module):
 def create_theme_encoder(preset: str, vocab_size: int = 32000, max_tokens: int = 1024) -> ThemeEncoder:
     """Create a ThemeEncoder model from a named preset."""
     presets = {
-        # ~32.1M params (core=30.0M, projector=0.9M, aggregator=0.7M)
+        # ~33.7M params (core=30.0M, projector=1.2M, aggregator=0.7M, profile_head=0.6M, global_pos=1.2M)
         "test": dict(embed_dim=384, num_layers=10, nhead=6,  proj_dim=64,  dropout=0.10, num_proj_layers=2, ff_mult=4, proj_ff_mult=2),
-        # ~74.7M params (core=66.7M, projector=6.4M, aggregator=1.3M)
+        # ~77.1M params (core=66.7M, projector=6.4M, aggregator=1.3M, profile_head=1.1M, global_pos=1.6M)
         "base": dict(embed_dim=512, num_layers=16, nhead=8,  proj_dim=128, dropout=0.08, num_proj_layers=3, ff_mult=4, proj_ff_mult=4),
-        # ~217.3M params (core=194.5M, projector=19.2M, aggregator=3.0M)
+        # ~221.5M params (core=194.5M, projector=19.2M, aggregator=3.0M, profile_head=2.4M, global_pos=2.4M)
         "deep": dict(embed_dim=768, num_layers=24, nhead=12, proj_dim=384, dropout=0.04, num_proj_layers=4, ff_mult=4, proj_ff_mult=4),
     }
     if preset not in presets:
         raise ValueError(f"Unknown preset '{preset}'. Choose from: {list(presets.keys())}")
     return ThemeEncoder(vocab_size=vocab_size, max_tokens=max_tokens, **presets[preset])
+
+

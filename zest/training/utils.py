@@ -211,7 +211,7 @@ class CheckpointManager:
             raise FileNotFoundError(f"No checkpoint at {path}")
         ckpt = torch.load(path, map_location=map_location, weights_only=False)
         m = model._orig_mod if hasattr(model, "_orig_mod") else model
-        m.load_state_dict(ckpt["model_state_dict"])
+        m.load_state_dict(ckpt["model_state_dict"], strict=False)
         if optimizer and "optimizer_state_dict" in ckpt:
             try:
                 optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -308,7 +308,7 @@ def build_llrd_param_groups(model, base_lr: float, head_lr: float,
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     n_layers = m.core.num_layers
     if head_prefixes is None:
-        head_prefixes = ("aggregator", "projector", "temperature")
+        head_prefixes = ("aggregator", "projector", "log_temperature")
 
     head_params = [p for n, p in m.named_parameters()
                    if p.requires_grad and any(n.startswith(h) for h in head_prefixes)]

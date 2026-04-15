@@ -13,9 +13,40 @@ Code domain:
 
 Shared:
     - ``MemoryBank`` — FIFO queue of detached embeddings for extra negatives
+    - ``UncertaintyWeightedLoss`` — learned multi-task weighting (Kendall et al.)
 """
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# Multi-task uncertainty weighting
+# ---------------------------------------------------------------------------
+
+class UncertaintyWeightedLoss(nn.Module):
+    """Learned uncertainty weighting for multi-task losses (Kendall et al.)."""
+    def __init__(self, num_tasks=2):
+        super().__init__()
+        self.log_vars = nn.Parameter(torch.zeros(num_tasks))
+
+    def forward(self, loss_token, loss_residue, priority_token=0.7, priority_residue=0.3):
+        precision_token = torch.exp(-self.log_vars[0])
+        loss_1 = precision_token * loss_token + 0.5 * self.log_vars[0]
+        precision_residue = torch.exp(-self.log_vars[1])
+        loss_2 = precision_residue * loss_residue + 0.5 * self.log_vars[1]
+        weighted_loss = priority_token * loss_1 + priority_residue * loss_2
+
+        with torch.no_grad():
+            ew_tok = priority_token * precision_token
+            ew_res = priority_residue * precision_residue
+            t_a = ew_tok * loss_token
+            t_b = ew_res * loss_residue
+            total = t_a + t_b + 1e-8
+        return weighted_loss, {
+            "w_tok": ew_tok.item(), "w_res": ew_res.item(),
+            "pct_tok": (t_a / total).item(), "pct_res": (t_b / total).item(),
+        }
 
 
 # ---------------------------------------------------------------------------

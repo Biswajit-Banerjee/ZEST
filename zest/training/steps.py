@@ -25,8 +25,12 @@ from zest.training.losses import (
 # Encoding helpers
 # ---------------------------------------------------------------------------
 
+def _get_model(model):
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
 def _encode_batch(model, tokens, mask):
-    m = model._orig_mod if hasattr(model, "_orig_mod") else model
+    m = _get_model(model)
     embs = m.encode_tokens(tokens, mask)
     family = m.aggregator(embs, mask)
     proj = F.normalize(m.projector(family), p=2, dim=-1)
@@ -72,6 +76,15 @@ def _compute_losses_protein(model, batch, device, amp, args, memory_bank=None):
         same_sf = h_anc == h_pos
         mem = memory_bank.sample(args.memory_bank_samples) if memory_bank else None
 
+        # Scale CLI temperatures by learned temperature (preserves per-level ratios)
+        m = _get_model(model)
+        tau = m.temperature
+        init_temp = 0.07  # must match log_temperature init
+        scale = tau / init_temp
+        temp_a = args.temp_a * scale
+        temp_t = args.temp_t * scale
+        temp_h = args.temp_h * scale
+
         if same_sf.sum() > 0:
             sf_anc = anc_proj[same_sf]
             sf_pos = pos_proj[same_sf]
@@ -84,7 +97,7 @@ def _compute_losses_protein(model, batch, device, amp, args, memory_bank=None):
 
             infonce = hierarchical_infonce(
                 nce_emb, nce_a, nce_t, nce_h,
-                temp_a=args.temp_a, temp_t=args.temp_t, temp_h=args.temp_h,
+                temp_a=temp_a, temp_t=temp_t, temp_h=temp_h,
                 weight_a=args.weight_a, weight_t=args.weight_t, weight_h=args.weight_h,
                 mem_emb=mem[0] if mem else None,
                 mem_a=mem[1] if mem else None,
@@ -103,7 +116,7 @@ def _compute_losses_protein(model, batch, device, amp, args, memory_bank=None):
             cw_a = args.weight_a / ta_sum if ta_sum > 0 else 0.5
             cross_nce = hierarchical_infonce(
                 all_emb, all_a, all_t, all_h,
-                temp_a=args.temp_a, temp_t=args.temp_t, temp_h=args.temp_h,
+                temp_a=temp_a, temp_t=temp_t, temp_h=temp_h,
                 weight_a=cw_a, weight_t=cw_t, weight_h=0.0,
             )
 
@@ -139,6 +152,7 @@ def _compute_losses_protein(model, batch, device, amp, args, memory_bank=None):
         "sap": sap["sap_loss"],
         "rank": rank["rank_loss"],
         "acc_h": infonce.get("acc_h", torch.tensor(0.0, device=device)),
+        "tau": tau.detach(),
     }
     metrics = {k: v.detach() for k, v in metrics.items()}
 
@@ -167,8 +181,11 @@ def _compute_losses_code(model, batch, device, amp, args, memory_bank=None):
 
         # Single-level InfoNCE with memory bank
         mem = memory_bank.sample(args.memory_bank_samples) if memory_bank else None
+        m = _get_model(model)
+        tau = m.temperature
+
         infonce = code_infonce(
-            all_emb, all_labels, temp=args.temp_h,
+            all_emb, all_labels, temp=tau,
             mem_emb=mem[0] if mem else None,
             mem_labels=mem[3] if mem else None,  # h_labels slot in memory bank
             hard_neg_weight=args.hard_neg_weight,
@@ -192,6 +209,7 @@ def _compute_losses_code(model, batch, device, amp, args, memory_bank=None):
         "sap": sap["sap_loss"],
         "clone_acc": infonce.get("acc", torch.tensor(0.0, device=device)),
         "map_at_r": infonce.get("map_at_r", torch.tensor(0.0, device=device)),
+        "tau": tau.detach(),
     }
     metrics = {k: v.detach() for k, v in metrics.items()}
 
@@ -229,8 +247,8 @@ def eval_step(batch, model, device, amp, args):
 
 
 # Metric key sets per domain
-METRIC_KEYS_PROTEIN = ("loss", "con", "cross", "sap", "rank", "acc_h")
-METRIC_KEYS_CODE = ("loss", "con", "sap", "clone_acc", "map_at_r")
+METRIC_KEYS_PROTEIN = ("loss", "con", "cross", "sap", "rank", "acc_h", "tau")
+METRIC_KEYS_CODE = ("loss", "con", "sap", "clone_acc", "map_at_r", "tau")
 
 
 def get_metric_keys(domain: str):

@@ -45,11 +45,13 @@ class MLMDataset(Dataset):
                  shards_per_epoch: Optional[int] = None,
                  unique_shards: bool = False,
                  seed: int = 42,
-                 encoder: Optional[callable] = None):
+                 encoder: Optional[callable] = None,
+                 residue_mlm: bool = False):
         self.tokenizer = tokenizer
         self.is_training = is_training
         self.max_tokens = max_tokens
         self.trie_dropout = trie_dropout
+        self.residue_mlm = residue_mlm
         self._seq_column = seq_column
         self._lang_column = lang_column
         self._seed = seed
@@ -146,14 +148,36 @@ class MLMDataset(Dataset):
 
     def __getitem__(self, idx: int):
         dropout = self.trie_dropout if self.is_training else 0.0
+        seq = self._seqs[idx]
+
+        # Residue-level MLM path: need token_lengths + aa_labels
+        if self.residue_mlm and self._encoder is None and hasattr(self.tokenizer, '_segment'):
+            text = self.tokenizer._ws.sub("", seq).upper()
+            symbols = list(text)
+            segments = self.tokenizer._segment(symbols, dropout)
+            if self.max_tokens and len(segments) > self.max_tokens:
+                segments = segments[:self.max_tokens]
+            token_ids = [tid for _, tid in segments]
+            token_lengths = [length for length, _ in segments]
+            n_residues = sum(token_lengths)
+            aa_labels = [
+                AA_TO_IDX.get(AA_SANITIZE.get(c, c), 0)
+                for c in text[:n_residues]
+            ]
+            return {
+                "input_ids": torch.tensor(token_ids, dtype=torch.long),
+                "token_lengths": torch.tensor(token_lengths, dtype=torch.long),
+                "aa_labels": torch.tensor(aa_labels, dtype=torch.long),
+                "global_indices": torch.arange(n_residues, dtype=torch.long),
+            }
+
+        # Standard token-only path
         if self._encoder is not None and self._langs is not None:
-            # Multi-lang encoder: wrap it so tokenizer handles str→id conversion
             lang = self._langs[idx]
             enc_fn = lambda src: self._encoder(src, lang)
-            ids = self.tokenizer.encode(self._seqs[idx], dropout=dropout,
-                                        encoder=enc_fn)
+            ids = self.tokenizer.encode(seq, dropout=dropout, encoder=enc_fn)
         else:
-            ids = self.tokenizer.encode(self._seqs[idx], dropout=dropout,
+            ids = self.tokenizer.encode(seq, dropout=dropout,
                                         encoder=self._encoder)
         if self.max_tokens and len(ids) > self.max_tokens:
             ids = ids[:self.max_tokens]
@@ -180,11 +204,22 @@ def mlm_collate_fn(batch: List[Dict], pad_id: int = 0, mask_id: int = 4,
 
         token_labels[to_mask] = ids[to_mask]
 
-    return {
+    out = {
         "input_ids": masked_ids,
         "attention_mask": attn_mask,
         "token_labels": token_labels,
     }
+
+    # Residue-level fields (present when residue_mlm=True in dataset)
+    if "token_lengths" in batch[0]:
+        out["token_lengths"] = pad_sequence(
+            [b["token_lengths"] for b in batch], batch_first=True, padding_value=0)
+        out["global_indices"] = pad_sequence(
+            [b["global_indices"] for b in batch], batch_first=True, padding_value=0)
+        out["aa_labels"] = pad_sequence(
+            [b["aa_labels"] for b in batch], batch_first=True, padding_value=-100)
+
+    return out
 
 
 # ---------------------------------------------------------------------------

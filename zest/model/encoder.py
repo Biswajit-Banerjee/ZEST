@@ -5,37 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
-
-
-class RotaryPositionalEmbedding(nn.Module):
-    """RoPE with optional linear scaling for sequences longer than max_tokens."""
-
-    def __init__(self, dim: int, max_tokens: int = 512, base: int = 10000,
-                 scaling_type: str | None = "linear"):
-        super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-        self.max_tokens = max_tokens
-        self.scaling_type = scaling_type
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        seq_len = x.shape[1]
-        positions = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
-        if seq_len > self.max_tokens and self.scaling_type == "linear":
-            positions = positions * (self.max_tokens / seq_len)
-        freqs = torch.einsum("i,j->ij", positions, self.inv_freq)
-        return torch.cat([freqs, freqs], dim=-1)[None, :, :]
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat([-x2, x1], dim=-1)
-
-
-def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, pos_emb: torch.Tensor):
-    cos, sin = pos_emb.cos(), pos_emb.sin()
-    return (q * cos + _rotate_half(q) * sin,
-            k * cos + _rotate_half(k) * sin)
+from zest.model.positional import apply_rotary_pos_emb
+from zest.model.positional import RotaryPositionalEmbedding as RoPE
 
 class AttentionBlock(nn.Module):
     """
@@ -126,9 +97,7 @@ class Encoder(nn.Module):
 
         self.token_emb = nn.Embedding(vocab_size, embed_dim, padding_idx=padding_idx)
         self.emb_dropout = nn.Dropout(dropout)
-        self.rope = RotaryPositionalEmbedding(
-            embed_dim // nhead, max_tokens, scaling_type=rope_scaling_type,
-        )
+        self.rope = RoPE(embed_dim // nhead, max_tokens, scaling_type=rope_scaling_type)
         self.layers = nn.ModuleList([
             AttentionBlock(embed_dim, nhead, ff_mult, dropout) for _ in range(num_layers)
         ])
