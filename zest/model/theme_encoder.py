@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from zest.model.encoder import Encoder
 from zest.model.pooling import AttentionAggregator
-from zest.model.heads import ProfileExpansionHead
+from zest.model.heads import ExpansionHead
 
 
 _log = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ class ThemeEncoder(nn.Module):
         # Similarity components
         self.log_temperature = nn.Parameter(torch.tensor(0.07).log())
         self.aggregator = AttentionAggregator(self.embed_dim, dropout=dropout)
-        self.profile_expansion_head = ProfileExpansionHead(self.embed_dim, max_residues=3*self.max_tokens)
+        self.profile_expansion_head = ExpansionHead(self.embed_dim, max_residues=3*self.max_tokens)
         self.global_pos_emb = nn.Embedding(3*self.max_tokens, self.embed_dim)
 
         # Projector: bottleneck MLP

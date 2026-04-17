@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from zest.model.positional import ScaledPositionalEmbedding
 
-class ProfileExpansionHead(nn.Module):
+class ExpansionHead(nn.Module):
     """
     Expands token embeddings to residue-level logits over 20 AAs.
     """
