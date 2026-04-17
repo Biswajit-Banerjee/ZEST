@@ -23,13 +23,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 from zest.model.theme_encoder import ThemeEncoder
 from zest.tokenizer import ZESTTokenizer
 from zest.data.finetune import HierarchicalPairDataset, finetune_collate_fn
-from zest.training.losses import MemoryBank
+from zest.training.losses import MemoryBank, UncertaintyWeightedLoss
 from zest.training.steps import train_step, eval_step, get_metric_keys
 from zest.training.utils import (
     CheckpointManager, build_cosine_schedule, build_llrd_param_groups, setup_logging,
@@ -121,6 +121,12 @@ def parse_args():
     p.add_argument("--domain",           default="protein", choices=["protein", "code"], help="Data domain")
     p.add_argument("--ast-language",     default="cpp",              help="Language for AST encoder (code domain only)")
     p.add_argument("--tokenizer-type",   default="zest", choices=["zest", "bpe", "char"], help="Tokenizer type (zest=trie, bpe=subword baseline, char=character-level)")
+    p.add_argument("--residue-mlm-weight", type=float, default=0.0, help="Residue MLM auxiliary weight (0 disables)")
+    p.add_argument("--ft-mask-prob",     type=float, default=0.05, help="Light masking prob for residue MLM during finetune")
+    p.add_argument("--fold-balanced",    action="store_true",        help="Use fold-balanced sampling (inverse sqrt freq)")
+    p.add_argument("--crop-ratio",       type=float, default=0.7,    help="Min crop ratio for augmentation (0 disables)")
+    p.add_argument("--crop-prob",        type=float, default=0.0,    help="Probability of random crop per sample")
+    p.add_argument("--crop-small-threshold", type=int, default=50,   help="Fold size below which crop is 3x more likely")
     return p.parse_args()
 
 
@@ -187,6 +193,16 @@ def main():
         for p in module.parameters():
             p.requires_grad = True
 
+    # Unfreeze residue heads when residue MLM is active
+    if args.residue_mlm_weight > 0:
+        for module in [m.profile_expansion_head, m.global_pos_emb]:
+            if isinstance(module, nn.Parameter):
+                module.requires_grad = True
+            elif isinstance(module, nn.Module):
+                for p in module.parameters():
+                    p.requires_grad = True
+        log.info("Residue MLM enabled: unfroze profile_expansion_head + global_pos_emb")
+
     total_params = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info("Model: %.1fM total, %.1fM trainable (%.1f%%)",
@@ -225,13 +241,20 @@ def main():
             log.info("Code domain: role encoder for %s (dropout=%.2f)",
                      args.ast_language, args.bpe_dropout)
 
+    residue_mlm = args.residue_mlm_weight > 0 and args.domain == "protein"
     train_ds = HierarchicalPairDataset(
         args.shards_dir, tokenizer, max_tokens=args.max_tokens,
         shards_per_epoch=args.shards_per_epoch, bpe_dropout=args.bpe_dropout,
         encoder=encoder, encoder_cfg=encoder_cfg,
+        residue_mlm=residue_mlm,
+        crop_ratio=args.crop_ratio, crop_prob=args.crop_prob,
+        crop_small_threshold=args.crop_small_threshold,
     )
     val_ds = None
-    collate = lambda b: finetune_collate_fn(b, tokenizer.pad_id)
+    ft_mask_prob = args.ft_mask_prob if residue_mlm else 0.0
+    collate = lambda b: finetune_collate_fn(
+        b, tokenizer.pad_id, mask_id=tokenizer.mask_id,
+        vocab_size=tokenizer.vocab_size, mask_prob=ft_mask_prob)
 
     bs, ga = args.batch_size, args.grad_accum_steps
     nw = args.num_workers
@@ -239,14 +262,28 @@ def main():
     loader_gen = torch.Generator()
     loader_gen.manual_seed(args.seed)
 
-    def make_loader(ds, shuffle=True, drop_last=True):
+    def make_loader(ds, shuffle=True, drop_last=True, sampler=None):
         return DataLoader(
-            ds, bs, shuffle=shuffle,
+            ds, bs, shuffle=(shuffle and sampler is None), sampler=sampler,
             num_workers=nw,
             pin_memory=True, collate_fn=collate, drop_last=drop_last,
             worker_init_fn=_seed_worker, generator=loader_gen,
             prefetch_factor=pf if nw > 0 else None,
         )
+
+    # Fold-balanced sampling
+    train_sampler = None
+    if args.fold_balanced:
+        weights = train_ds.get_sample_weights()
+        train_sampler = WeightedRandomSampler(
+            weights, len(weights), replacement=True, generator=loader_gen)
+        log.info("Fold-balanced sampling enabled (%d weights)", len(weights))
+
+    # Uncertainty weighting for residue MLM
+    combine_loss = None
+    if residue_mlm:
+        combine_loss = UncertaintyWeightedLoss(num_tasks=2).to(device)
+        args.combine_loss = combine_loss
 
     # Optimizer
     encoder_lr = args.lr * args.encoder_lr_scale
@@ -261,13 +298,15 @@ def main():
                         if p.requires_grad and n.startswith("core")],
              "lr": encoder_lr},
         ]
+    if combine_loss is not None:
+        groups.append({"params": list(combine_loss.parameters()), "lr": args.lr})
     opt = optim.AdamW(groups, lr=args.lr, weight_decay=args.weight_decay)
 
     # Memory bank
     proj_dim = m.proj_dim
     memory_bank = MemoryBank(args.memory_bank_size, proj_dim, device) if args.memory_bank_size > 0 else None
 
-    loader = make_loader(train_ds)
+    loader = make_loader(train_ds, sampler=train_sampler)
     val_loader = None
 
     steps_ep = max(1, len(loader) // ga)
@@ -434,9 +473,13 @@ def main():
             msg += (f"] loss={t_metrics['loss']:.4f} con={t_metrics['con']:.4f}"
                     f" cross={t_metrics['cross']:.4f} sap={t_metrics['sap']:.4f}"
                     f" rank={t_metrics['rank']:.4f} acc_h={t_metrics['acc_h']:.4f}")
+            if t_metrics.get('res_loss', 0) > 0:
+                msg += f" | res_loss={t_metrics['res_loss']:.4f} res_acc={t_metrics['res_acc']:.3f}"
             if v_metrics:
                 msg += (f" | val_loss={v_metrics['loss']:.4f}"
                         f" val_acc_h={v_metrics['acc_h']:.4f}")
+                if v_metrics.get('res_loss', 0) > 0:
+                    msg += f" val_res_acc={v_metrics['res_acc']:.3f}"
         log.info(msg)
 
         # Save checkpoint + metrics
@@ -455,3 +498,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+    """
+    python -m zest.training.finetune \
+    --checkpoint outputs/deep_dual_mlm/pretrain/best.pth \
+    --residue-mlm-weight 0.3 \
+    --ft-mask-prob 0.05 \
+    --unfreeze-layers -1 \
+    --epochs 8 --batch-size 64 --amp
+    """

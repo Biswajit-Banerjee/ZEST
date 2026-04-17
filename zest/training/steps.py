@@ -47,6 +47,50 @@ def _encode_pair_batch(model, anc_tok, anc_mask, pos_tok, pos_mask):
     return _encode_batch(model, anc_tok, anc_mask), _encode_batch(model, pos_tok, pos_mask)
 
 
+def _encode_batch_with_embs(model, tokens, mask):
+    """Encode and return both projections and token embeddings."""
+    m = _get_model(model)
+    embs = m.encode_tokens(tokens, mask)
+    family = m.aggregator(embs, mask)
+    proj = F.normalize(m.projector(family), p=2, dim=-1)
+    return proj, embs
+
+
+def _encode_pair_batch_with_embs(model, anc_tok, anc_mask, pos_tok, pos_mask):
+    """Encode pair and return projections + token embeddings for both."""
+    if anc_tok.shape[1] == pos_tok.shape[1]:
+        tokens = torch.cat([anc_tok, pos_tok], dim=0)
+        mask = torch.cat([anc_mask, pos_mask], dim=0)
+        proj, embs = _encode_batch_with_embs(model, tokens, mask)
+        B = anc_tok.shape[0]
+        return proj[:B], proj[B:], embs[:B], embs[B:]
+    proj_a, emb_a = _encode_batch_with_embs(model, anc_tok, anc_mask)
+    proj_p, emb_p = _encode_batch_with_embs(model, pos_tok, pos_mask)
+    return proj_a, proj_p, emb_a, emb_p
+
+
+def _compute_residue_mlm(model, token_embs, batch, device, prefix):
+    """Compute residue-level MLM loss from token embeddings."""
+    m = _get_model(model)
+    token_lengths = batch[f"{prefix}_token_lengths"].to(device, non_blocking=True)
+    global_indices = batch[f"{prefix}_global_indices"].to(device, non_blocking=True)
+    aa_labels = batch[f"{prefix}_aa_labels"].to(device, non_blocking=True)
+
+    residue_logits = m.profile_expansion_head(
+        token_embs, token_lengths, global_indices, m.global_pos_emb)
+
+    logits_flat = residue_logits.reshape(-1, residue_logits.size(-1))
+    labels_flat = aa_labels.reshape(-1)
+    loss = F.cross_entropy(logits_flat, labels_flat, ignore_index=-100)
+
+    valid = labels_flat != -100
+    if valid.sum() > 0:
+        acc = (logits_flat[valid].argmax(-1) == labels_flat[valid]).float().mean()
+    else:
+        acc = torch.tensor(0.0, device=device)
+    return loss, acc
+
+
 # ---------------------------------------------------------------------------
 # Protein domain forward pass
 # ---------------------------------------------------------------------------
@@ -64,8 +108,13 @@ def _compute_losses_protein(model, batch, device, amp, args, memory_bank=None):
     t_pos = batch["t_pos_labels"].to(device, non_blocking=True)
     h_pos = batch["h_pos_labels"].to(device, non_blocking=True)
 
+    has_residue = "anchor_token_lengths" in batch
     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-        anc_proj, pos_proj = _encode_pair_batch(model, anc_tok, anc_mask, pos_tok, pos_mask)
+        if has_residue and getattr(args, "residue_mlm_weight", 0) > 0:
+            anc_proj, pos_proj, anc_embs, pos_embs = _encode_pair_batch_with_embs(
+                model, anc_tok, anc_mask, pos_tok, pos_mask)
+        else:
+            anc_proj, pos_proj = _encode_pair_batch(model, anc_tok, anc_mask, pos_tok, pos_mask)
 
         all_emb = torch.cat([anc_proj, pos_proj])
         all_a = torch.cat([a_anc, a_pos])
@@ -140,10 +189,31 @@ def _compute_losses_protein(model, batch, device, amp, args, memory_bank=None):
                 level_weights=tuple(args.rank_level_weights),
             )
 
-        loss = (args.contrastive_weight * infonce["loss"]
-                + args.cross_level_weight * cross_nce["loss"]
-                + args.smooth_ap_weight * sap["sap_loss"]
-                + args.rank_weight * rank["rank_loss"])
+        contrastive_loss = (args.contrastive_weight * infonce["loss"]
+                            + args.cross_level_weight * cross_nce["loss"]
+                            + args.smooth_ap_weight * sap["sap_loss"]
+                            + args.rank_weight * rank["rank_loss"])
+
+        # Residue MLM auxiliary loss
+        res_loss = torch.tensor(0.0, device=device)
+        res_acc = torch.tensor(0.0, device=device)
+        if has_residue and getattr(args, "residue_mlm_weight", 0) > 0:
+            anc_rl, anc_ra = _compute_residue_mlm(model, anc_embs, batch, device, "anchor")
+            pos_rl, pos_ra = _compute_residue_mlm(model, pos_embs, batch, device, "positive")
+            res_loss = (anc_rl + pos_rl) / 2
+            res_acc = (anc_ra + pos_ra) / 2
+
+            combine_loss = getattr(args, "combine_loss", None)
+            if combine_loss is not None:
+                loss, _ = combine_loss(
+                    contrastive_loss, res_loss,
+                    priority_token=args.contrastive_weight,
+                    priority_residue=args.residue_mlm_weight,
+                )
+            else:
+                loss = contrastive_loss + args.residue_mlm_weight * res_loss
+        else:
+            loss = contrastive_loss
 
     metrics = {
         "loss": loss,
@@ -153,6 +223,8 @@ def _compute_losses_protein(model, batch, device, amp, args, memory_bank=None):
         "rank": rank["rank_loss"],
         "acc_h": infonce.get("acc_h", torch.tensor(0.0, device=device)),
         "tau": tau.detach(),
+        "res_loss": res_loss,
+        "res_acc": res_acc,
     }
     metrics = {k: v.detach() for k, v in metrics.items()}
 
@@ -247,7 +319,7 @@ def eval_step(batch, model, device, amp, args):
 
 
 # Metric key sets per domain
-METRIC_KEYS_PROTEIN = ("loss", "con", "cross", "sap", "rank", "acc_h", "tau")
+METRIC_KEYS_PROTEIN = ("loss", "con", "cross", "sap", "rank", "acc_h", "tau", "res_loss", "res_acc")
 METRIC_KEYS_CODE = ("loss", "con", "sap", "clone_acc", "map_at_r", "tau")
 
 

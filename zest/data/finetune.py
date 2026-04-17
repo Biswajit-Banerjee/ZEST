@@ -2,7 +2,7 @@
 Hierarchical CATH pair dataset for contrastive fine-tuning.
 
 Each sample yields an anchor/positive protein pair with hierarchy labels at
-Architecture (C.A), Topology (C.A.T), and Superfamily (C.A.T.H) levels.
+Architecture (C.A), Fold/Topology (C.A.T), and Superfamily (C.A.T.H) levels.
 """
 import glob
 import logging
@@ -16,7 +16,10 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
+
+from zest.data.pretrain import AA_TO_IDX, AA_SANITIZE
 
 _log = logging.getLogger(__name__)
 
@@ -55,6 +58,8 @@ def _tokenize_chunk(args):
             from experiments.code.build_role_tokenizer import make_role_encoder
             encoder = make_role_encoder(cfg["language"])
 
+    residue_mlm = cfg.get("residue_mlm", False)
+
     results = []
     for idx, seq in chunk:
         if encoder is not None:
@@ -63,11 +68,25 @@ def _tokenize_chunk(args):
                 ids = result
             else:
                 ids = tok.encode_symbols(result, dropout=dropout) if hasattr(tok, 'encode_symbols') else tok.encode(seq, dropout=dropout)
+            if max_tokens and len(ids) > max_tokens:
+                ids = ids[:max_tokens]
+            results.append((idx, ids))
+        elif residue_mlm and hasattr(tok, '_segment'):
+            text = tok._ws.sub("", seq).upper()
+            symbols = list(text)
+            segments = tok._segment(symbols, dropout)
+            if max_tokens and len(segments) > max_tokens:
+                segments = segments[:max_tokens]
+            token_ids = [tid for _, tid in segments]
+            token_lengths = [length for length, _ in segments]
+            n_residues = sum(token_lengths)
+            aa_labels = [AA_TO_IDX.get(AA_SANITIZE.get(c, c), 0) for c in text[:n_residues]]
+            results.append((idx, {"ids": token_ids, "token_lengths": token_lengths, "aa_labels": aa_labels}))
         else:
             ids = tok.encode(seq, dropout=dropout)
-        if max_tokens and len(ids) > max_tokens:
-            ids = ids[:max_tokens]
-        results.append((idx, ids))
+            if max_tokens and len(ids) > max_tokens:
+                ids = ids[:max_tokens]
+            results.append((idx, ids))
     return results
 
 
@@ -94,13 +113,22 @@ class HierarchicalPairDataset(Dataset):
     def __init__(self, shards_dir: str, tokenizer, max_tokens: int = 512,
                  shards_per_epoch: Optional[int] = None, seed: int = 42,
                  bpe_dropout: float = 0.0, encoder=None,
-                 encoder_cfg: Optional[Dict] = None, **kwargs):
+                 encoder_cfg: Optional[Dict] = None, residue_mlm: bool = False,
+                 crop_ratio: float = 0.0, crop_prob: float = 0.0,
+                 crop_small_threshold: int = 50,
+                 **kwargs):
         self.tokenizer = tokenizer
         self.max_tokens = max_tokens
         self.seed = seed
         self.bpe_dropout = bpe_dropout
         self._encoder = encoder
-        self._encoder_cfg = encoder_cfg
+        self._encoder_cfg = encoder_cfg or {}
+        self.residue_mlm = residue_mlm
+        if residue_mlm:
+            self._encoder_cfg["residue_mlm"] = True
+        self.crop_ratio = crop_ratio
+        self.crop_prob = crop_prob
+        self.crop_small_threshold = crop_small_threshold
         self._epoch = 0
 
         self.shard_paths = sorted(glob.glob(os.path.join(shards_dir, "*.parquet")))
@@ -130,14 +158,23 @@ class HierarchicalPairDataset(Dataset):
         # Pre-load all pair metadata into compact numpy arrays
         self._preload_pairs()
 
+        # Fold (topology) frequency per pair — for balanced sampling & crop
+        from collections import Counter
+        fold_counts = Counter(self._t_labels.tolist())
+        self._pair_fold_sizes = np.array(
+            [fold_counts[t] for t in self._t_labels], dtype=np.int32)
+        n_small = (self._pair_fold_sizes < self.crop_small_threshold).sum()
+
         # Active indices (subset when shards_per_epoch < num_shards)
         self._active = np.arange(len(self._q_idx))
         self._token_cache = [None] * len(self._sequences)
 
         _log.info("HierarchicalPairDataset: %d shards, %d valid pairs, "
-                   "%d unique seqs, %d A / %d T / %d H labels",
+                   "%d unique seqs, %d A / %d T / %d H labels, "
+                   "%d pairs from small folds (<%d)",
                    self.num_shards, len(self._q_idx), len(self._sequences),
-                   len(self.a_map), len(self.t_map), len(self.h_map))
+                   len(self.a_map), len(self.t_map), len(self.h_map),
+                   n_small, self.crop_small_threshold)
 
         # Pre-tokenize for first epoch so DataLoader can start immediately
         self.set_epoch(0)
@@ -275,11 +312,102 @@ class HierarchicalPairDataset(Dataset):
         self._token_cache = [None] * len(self._sequences)
         self._retokenize(needed)
 
+    # ------------------------------------------------------------------
+    # Fold-balanced sampling
+    # ------------------------------------------------------------------
+
+    def get_sample_weights(self, min_fold_freq: int = 10):
+        """Per-pair weights for fold-balanced sampling (clamped inverse sqrt).
+
+        Folds below ``min_fold_freq`` pairs are clamped so singletons and
+        near-singletons don't get extreme oversampling that leads to
+        overfitting on the same few pairs.
+        """
+        from collections import Counter
+        active_folds = self._t_labels[self._active]
+        fold_counts = Counter(active_folds.tolist())
+        weights = np.array([1.0 / np.sqrt(max(fold_counts[t], min_fold_freq))
+                            for t in active_folds], dtype=np.float64)
+        weights /= weights.sum()
+        return torch.from_numpy(weights).double()
+
+    # ------------------------------------------------------------------
+    # Random crop augmentation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _random_crop(entry, min_ratio=0.7):
+        """Random contiguous crop of a token sequence (list or residue dict)."""
+        if isinstance(entry, dict):
+            ids = entry["ids"]
+            tl = entry["token_lengths"]
+            aa = entry["aa_labels"]
+            n = len(ids)
+            if n <= 4:
+                return entry
+            crop_n = random.randint(max(2, int(n * min_ratio)), n)
+            start = random.randint(0, n - crop_n)
+            new_tl = tl[start:start + crop_n]
+            res_start = sum(tl[:start])
+            res_end = res_start + sum(new_tl)
+            return {
+                "ids": ids[start:start + crop_n],
+                "token_lengths": new_tl,
+                "aa_labels": aa[res_start:res_end],
+            }
+        else:
+            n = len(entry)
+            if n <= 4:
+                return entry
+            crop_n = random.randint(max(2, int(n * min_ratio)), n)
+            start = random.randint(0, n - crop_n)
+            return entry[start:start + crop_n]
+
+    def _should_crop(self, real_idx):
+        """Decide whether to crop; boost for small-but-not-singleton folds.
+
+        Singletons (≤2 pairs) get base crop rate — oversampling them is
+        already risky, aggressive cropping on top would overfit.
+        Folds with 3–threshold pairs get 3× boost — enough pairs to
+        benefit from view diversity but sparse enough to need it.
+        """
+        fold_size = self._pair_fold_sizes[real_idx]
+        if fold_size <= 2:
+            return random.random() < self.crop_prob
+        if fold_size < self.crop_small_threshold:
+            return random.random() < min(self.crop_prob * 3, 0.9)
+        return random.random() < self.crop_prob
+
+    # ------------------------------------------------------------------
+    # Item access
+    # ------------------------------------------------------------------
+
     def __getitem__(self, idx):
         real = int(self._active[idx])
-        return {
-            "anchor_ids": self._token_cache[self._q_idx[real]],
-            "positive_ids": self._token_cache[self._t_idx[real]],
+        cache_q = self._token_cache[self._q_idx[real]]
+        cache_t = self._token_cache[self._t_idx[real]]
+
+        # Random crop augmentation
+        if self.crop_prob > 0 and self._should_crop(real):
+            cache_q = self._random_crop(cache_q, self.crop_ratio)
+            cache_t = self._random_crop(cache_t, self.crop_ratio)
+
+        if isinstance(cache_q, dict):
+            item = {
+                "anchor_ids": cache_q["ids"],
+                "positive_ids": cache_t["ids"],
+                "anchor_token_lengths": cache_q["token_lengths"],
+                "anchor_aa_labels": cache_q["aa_labels"],
+                "positive_token_lengths": cache_t["token_lengths"],
+                "positive_aa_labels": cache_t["aa_labels"],
+            }
+        else:
+            item = {
+                "anchor_ids": cache_q,
+                "positive_ids": cache_t,
+            }
+
+        item.update({
             "a_label": int(self._a_labels[real]),
             "t_label": int(self._t_labels[real]),
             "h_label": int(self._h_labels[real]),
@@ -287,24 +415,44 @@ class HierarchicalPairDataset(Dataset):
             "t_pos_label": int(self._t_pos_labels[real]),
             "h_pos_label": int(self._h_pos_labels[real]),
             "probability": float(self._probabilities[real]),
-        }
+        })
+        return item
 
 
-def finetune_collate_fn(batch: List[Dict], pad_id: int = 0):
-    """Collate anchor/positive pairs into padded tensors."""
+def finetune_collate_fn(batch: List[Dict], pad_id: int = 0,
+                        mask_id: int = 4, vocab_size: int = 32000,
+                        mask_prob: float = 0.0):
+    """Collate anchor/positive pairs into padded tensors with optional light masking."""
     def _pad(seqs):
         max_len = max(len(s) for s in seqs)
-        ids = torch.zeros(len(seqs), max_len, dtype=torch.long)
+        ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long)
         mask = torch.zeros(len(seqs), max_len, dtype=torch.long)
         for i, s in enumerate(seqs):
             ids[i, :len(s)] = torch.tensor(s, dtype=torch.long)
             mask[i, :len(s)] = 1
         return ids, mask
 
+    def _mask_tokens(ids, attn_mask):
+        """BERT-style light masking for auxiliary MLM."""
+        masked = ids.clone()
+        labels = torch.full_like(ids, -100)
+        prob = torch.full(ids.shape, mask_prob).masked_fill_(~attn_mask.bool(), 0.0)
+        to_mask = torch.bernoulli(prob).bool()
+        replace = torch.bernoulli(torch.full(ids.shape, 0.8)).bool() & to_mask
+        masked[replace] = mask_id
+        rand_pos = torch.bernoulli(torch.full(ids.shape, 0.5)).bool() & to_mask & ~replace
+        masked[rand_pos] = torch.randint(2, vocab_size, ids.shape)[rand_pos]
+        labels[to_mask] = ids[to_mask]
+        return masked, labels
+
     anc_ids, anc_mask = _pad([b["anchor_ids"] for b in batch])
     pos_ids, pos_mask = _pad([b["positive_ids"] for b in batch])
 
-    return {
+    if mask_prob > 0:
+        anc_ids, anc_tok_labels = _mask_tokens(anc_ids, anc_mask)
+        pos_ids, pos_tok_labels = _mask_tokens(pos_ids, pos_mask)
+
+    out = {
         "anchor_ids": anc_ids,
         "anchor_mask": anc_mask,
         "positive_ids": pos_ids,
@@ -317,3 +465,27 @@ def finetune_collate_fn(batch: List[Dict], pad_id: int = 0):
         "h_pos_labels": torch.tensor([b["h_pos_label"] for b in batch], dtype=torch.long),
         "probabilities": torch.tensor([b["probability"] for b in batch], dtype=torch.float32),
     }
+
+    if mask_prob > 0:
+        out["anchor_token_labels"] = anc_tok_labels
+        out["positive_token_labels"] = pos_tok_labels
+
+    if "anchor_token_lengths" in batch[0]:
+        for prefix, key_prefix in [("anchor", "anchor"), ("positive", "positive")]:
+            tl = pad_sequence(
+                [torch.tensor(b[f"{prefix}_token_lengths"], dtype=torch.long) for b in batch],
+                batch_first=True, padding_value=0)
+            aa = pad_sequence(
+                [torch.tensor(b[f"{prefix}_aa_labels"], dtype=torch.long) for b in batch],
+                batch_first=True, padding_value=-100)
+            B = tl.shape[0]
+            max_res = int(tl.sum(dim=1).max().item())
+            gi = torch.zeros(B, max_res, dtype=torch.long)
+            for i in range(B):
+                n = int(tl[i].sum().item())
+                gi[i, :n] = torch.arange(n)
+            out[f"{key_prefix}_token_lengths"] = tl
+            out[f"{key_prefix}_aa_labels"] = aa
+            out[f"{key_prefix}_global_indices"] = gi
+
+    return out
