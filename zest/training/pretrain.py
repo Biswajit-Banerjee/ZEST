@@ -37,7 +37,7 @@ def _is_oom(err):
 
 def train_step(batch, model, device, amp, ga,
                combine_loss=None, token_mlm_weight=0.7, residue_mlm_weight=0.3,
-               token_only=False):
+               token_only=False, residue_only=False):
     ids = batch["input_ids"].to(device)
     mask = batch["attention_mask"].to(device)
     labels = batch["token_labels"].to(device)
@@ -62,11 +62,17 @@ def train_step(batch, model, device, amp, ga,
                 res_logits[:, :ml, :].reshape(-1, 20),
                 aa[:, :ml].reshape(-1), ignore_index=-100)
 
-            balanced, loss_stats = combine_loss(
-                loss_token, loss_residue,
-                priority_token=token_mlm_weight,
-                priority_residue=residue_mlm_weight)
-            scaled = balanced / ga
+            if residue_only:
+                # Bypass UncertaintyWeightedLoss — use raw residue loss only
+                scaled = loss_residue / ga
+                loss_stats = {"w_tok": 0.0, "w_res": 1.0,
+                              "pct_tok": 0.0, "pct_res": 1.0}
+            else:
+                balanced, loss_stats = combine_loss(
+                    loss_token, loss_residue,
+                    priority_token=token_mlm_weight,
+                    priority_residue=residue_mlm_weight)
+                scaled = balanced / ga
 
         scaled.backward()
 
@@ -76,8 +82,15 @@ def train_step(batch, model, device, amp, ga,
         if valid.any():
             tok_acc = (logits.argmax(-1)[valid] == labels[valid]).float().mean()
 
+    if token_only or "token_lengths" not in batch:
+        loss_val = loss_token.detach().item()
+    elif residue_only:
+        loss_val = loss_residue.detach().item()
+    else:
+        loss_val = balanced.detach().item()
+
     metrics = {
-        "loss": loss_token.detach().item() if token_only or "token_lengths" not in batch else balanced.detach().item(),
+        "loss": loss_val,
         "tok_loss": loss_token.detach().item(),
         "tok_acc": tok_acc.item(),
     }
@@ -168,6 +181,8 @@ def parse_args():
     p.add_argument("--token-mlm-weight",  default=0.7,  type=float, help="Priority weight for token-level MLM")
     p.add_argument("--residue-mlm-weight", default=0.3, type=float, help="Priority weight for residue-level MLM (0 disables)")
     p.add_argument("--token-only",        action="store_true",       help="Token MLM only; skip residue head")
+    p.add_argument("--freeze-core",       action="store_true",       help="Freeze encoder core; only train residue head + global_pos_emb")
+    p.add_argument("--optim-checkpoint",  default=None,              help="Load optimizer/scheduler from this checkpoint (model from --checkpoint)")
     
     return p.parse_args()
 
@@ -268,6 +283,17 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     log.info("Model: %s (%.1fM params)", args.model, total_params / 1e6)
 
+    # Freeze core if requested (only residue head + global_pos_emb train)
+    if args.freeze_core:
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.profile_expansion_head.parameters():
+            p.requires_grad = True
+        model.global_pos_emb.weight.requires_grad = True
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        log.info("Core frozen — training %.1fM / %.1fM params (residue head + pos_emb)",
+                 trainable / 1e6, total_params / 1e6)
+
     bs, ga = args.batch_size, args.grad_accum_steps
     nw = args.num_workers
     pf = 8 if nw > 0 else None
@@ -282,13 +308,15 @@ def main():
 
     # Loss + optimizers
     token_only = args.token_only or args.residue_mlm_weight <= 0
+    residue_only = args.freeze_core  # bypass UncertaintyWeightedLoss when core frozen
     combine_loss = None
     opt_loss = None
-    if not token_only:
+    if not token_only and not residue_only:
         combine_loss = UncertaintyWeightedLoss(num_tasks=2).to(device)
         opt_loss = optim.AdamW(combine_loss.parameters(), lr=1e-3, weight_decay=0.0)
 
-    opt = optim.AdamW(model.parameters(), lr=args.lr)
+    train_params = [p for p in model.parameters() if p.requires_grad]
+    opt = optim.AdamW(train_params, lr=args.lr)
 
     loader = make_loader(train_ds)
     val_loader = make_loader(val_ds, shuffle=False, drop_last=False)
@@ -338,10 +366,24 @@ def main():
     # Resume from checkpoint
     start_epoch = 1
     if args.checkpoint:
-        ckpt = ckpt_mgr.load(args.checkpoint, model, opt, sched, map_location=device)
+        skip_optim = args.freeze_core or args.optim_checkpoint is not None
+        restore_opt = None if skip_optim else opt
+        restore_sched = None if skip_optim else sched
+        ckpt = ckpt_mgr.load(args.checkpoint, model, restore_opt, restore_sched, map_location=device)
         start_epoch = ckpt.get("epoch", 0) + 1
-        log.info("Resumed from %s (epoch %d, best_val=%.4f)",
-                 args.checkpoint, start_epoch - 1, ckpt_mgr.best_val_loss)
+
+        # Optionally load optimizer/scheduler from a different checkpoint
+        if args.optim_checkpoint:
+            ckpt_opt = torch.load(args.optim_checkpoint, map_location=device, weights_only=False)
+            opt.load_state_dict(ckpt_opt["optimizer_state_dict"])
+            if "scheduler_state_dict" in ckpt_opt:
+                sched.load_state_dict(ckpt_opt["scheduler_state_dict"])
+            log.info("Optimizer/scheduler restored from %s", args.optim_checkpoint)
+            del ckpt_opt
+
+        log.info("Resumed from %s (epoch %d, best_val=%.4f)%s",
+                 args.checkpoint, start_epoch - 1, ckpt_mgr.best_val_loss,
+                 " [freeze-core: fresh optimizer+scheduler]" if args.freeze_core else "")
 
     eval_residue = not token_only
     global_step = (start_epoch - 1) * max(1, len(loader) // ga)
@@ -372,6 +414,7 @@ def main():
                     token_mlm_weight=args.token_mlm_weight,
                     residue_mlm_weight=args.residue_mlm_weight,
                     token_only=token_only,
+                    residue_only=residue_only,
                 )
             except RuntimeError as e:
                 if _is_oom(e):
@@ -381,7 +424,7 @@ def main():
                     continue
                 raise
 
-            if math.isnan(m["tok_loss"]):
+            if math.isnan(m["tok_loss"]) or math.isnan(m.get("res_loss", 0)):
                 opt.zero_grad(set_to_none=True)
                 continue
 
@@ -417,7 +460,7 @@ def main():
                 global_step += 1
 
         # Flush remaining accumulated gradients
-        if n_steps % ga != 0:
+        if (i + 1) % ga != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             opt.step()
             if opt_loss is not None:
@@ -446,9 +489,11 @@ def main():
                 try:
                     vm = eval_step(batch, model, device, amp, eval_residue=eval_residue)
                     val_list.append(vm)
-                except RuntimeError:
-                    torch.cuda.empty_cache()
-                    continue
+                except RuntimeError as e:
+                    if _is_oom(e):
+                        torch.cuda.empty_cache()
+                        continue
+                    raise
             val_elapsed = time.time() - t1
             if val_list:
                 v_metrics = {k: np.mean([m[k] for m in val_list]) for k in val_list[0]}
