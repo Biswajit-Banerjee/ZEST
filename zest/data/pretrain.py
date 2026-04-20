@@ -184,6 +184,26 @@ class MLMDataset(Dataset):
         return {"input_ids": torch.tensor(ids, dtype=torch.long)}
 
 
+def _gate_aa_labels(to_mask: torch.Tensor, tl: torch.Tensor, aa: torch.Tensor):
+    """Set aa_labels to -100 at residues belonging to unmasked tokens.
+
+    Expands the token-level ``to_mask`` boolean to residue-level using
+    ``token_lengths`` so that only residues under masked tokens carry
+    real labels; everything else becomes ``-100`` (ignored by cross_entropy).
+    """
+    B, T = to_mask.shape
+    L = aa.shape[1]
+    res_mask = torch.zeros(B, L, dtype=torch.bool)
+    for b in range(B):
+        lengths_b = tl[b]
+        n_tok = (lengths_b > 0).sum().item()
+        if n_tok == 0:
+            continue
+        expanded = to_mask[b, :n_tok].repeat_interleave(lengths_b[:n_tok])
+        res_mask[b, :expanded.shape[0]] = expanded
+    aa[~res_mask] = -100
+
+
 def mlm_collate_fn(batch: List[Dict], pad_id: int = 0, mask_id: int = 4,
                    vocab_size: int = 32000, mask_prob: float = 0.15):
     """Collate with BERT-style masking: 80% [MASK], 10% random, 10% keep."""
@@ -192,6 +212,7 @@ def mlm_collate_fn(batch: List[Dict], pad_id: int = 0, mask_id: int = 4,
     attn_mask = ids != pad_id
     masked_ids = ids.clone()
     token_labels = torch.full_like(ids, -100)
+    to_mask = None
 
     if mask_prob > 0:
         prob = torch.full(ids.shape, mask_prob).masked_fill_(~attn_mask, 0.0)
@@ -212,12 +233,16 @@ def mlm_collate_fn(batch: List[Dict], pad_id: int = 0, mask_id: int = 4,
 
     # Residue-level fields (present when residue_mlm=True in dataset)
     if "token_lengths" in batch[0]:
-        out["token_lengths"] = pad_sequence(
+        tl = pad_sequence(
             [b["token_lengths"] for b in batch], batch_first=True, padding_value=0)
+        out["token_lengths"] = tl
         out["global_indices"] = pad_sequence(
             [b["global_indices"] for b in batch], batch_first=True, padding_value=0)
-        out["aa_labels"] = pad_sequence(
+        aa = pad_sequence(
             [b["aa_labels"] for b in batch], batch_first=True, padding_value=-100)
+        if to_mask is not None:
+            _gate_aa_labels(to_mask, tl, aa)
+        out["aa_labels"] = aa
 
     return out
 
@@ -277,7 +302,7 @@ class ProteinMPMDataset(Dataset):
         dropout = self.trie_dropout if self.is_training else 0.0
 
         text = self.tokenizer._ws.sub("", raw_seq).upper()
-        segments = self.tokenizer._segment(text, dropout=dropout)
+        segments = self.tokenizer._segment(list(text), dropout=dropout)
         if self.max_tokens:
             segments = segments[:self.max_tokens]
 
@@ -326,6 +351,7 @@ def mpm_collate_fn(batch: List[Dict], pad_id: int = 0, mask_id: int = 4,
     attn_mask = ids != pad_id
     masked_ids = ids.clone()
     token_labels = torch.full_like(ids, -100)
+    to_mask = None
 
     if mask_prob > 0:
         prob = torch.full(ids.shape, mask_prob).masked_fill_(~attn_mask, 0.0)
@@ -337,6 +363,9 @@ def mpm_collate_fn(batch: List[Dict], pad_id: int = 0, mask_id: int = 4,
         masked_ids[rand_pos] = torch.randint(2, vocab_size, ids.shape)[rand_pos]
 
         token_labels[to_mask] = ids[to_mask]
+
+    if to_mask is not None:
+        _gate_aa_labels(to_mask, tl, aa)
 
     return {
         "input_ids": masked_ids,

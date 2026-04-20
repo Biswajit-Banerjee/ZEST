@@ -205,7 +205,7 @@ class ZESTTokenizer:
         while i < n:
             matches = self._trie_match(symbols, i)
             if not matches:
-                segments.append((1, self.unk_id))
+                segments.append((1, self.mask_id))
                 i += 1
                 continue
             length, tid = matches[0]
