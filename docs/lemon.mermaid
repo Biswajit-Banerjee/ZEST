@@ -1,0 +1,89 @@
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'fontSize': '15px',
+    'primaryColor': '#F8F9FA',
+    'primaryBorderColor': '#ADB5BD',
+    'primaryTextColor': '#343A40',
+    'lineColor': '#868E96',
+    'fontFamily': 'Inter, Helvetica Neue, Arial, sans-serif'
+  },
+  'flowchart': {
+    'subGraphTitleMargin': { 'top': 3, 'bottom': 3 },
+    'padding': 16,
+    'nodeSpacing': 30,
+    'rankSpacing': 40
+  }
+}}%%
+
+flowchart LR
+    %% ── Input ──
+    input(["<b style='font-size:16px'>Input</b><br/><i>x</i> ∈ <b>Z</b><sup>B×T</sup>"])
+
+    %% ── Embedding ──
+    emb["<b style='font-size:16px'>Token Embedding</b><br/><b>Z</b><sup>B×T</sup> → <b>R</b><sup>B×T×D</sup>"]
+
+    %% ── Encoder > N × Block > MHA + FFN ──
+    subgraph ENC ["<b>Encoder</b>"]
+        direction LR
+        subgraph BLK ["<b><i>N</i> × Transformer Block</b>"]
+            direction LR
+            mhsa["<b>LN → MHA</b>"]
+            ffn["<b>LN → SwiGLU FFN</b>"]
+            mhsa -->|⊕ res| ffn
+        end
+        fnorm["Final LayerNorm"]
+        BLK --> |⊕ res| fnorm
+    end
+
+    %% ── Shared representation ──
+    z(["<b style='font-size:16px'>z</b> ∈ <b>R</b><sup>B×T×D</sup>"])
+
+    %% ── Sequence Head (Profile Expansion) ──
+    subgraph P1 ["<b>Sequence Head</b>"]
+        direction TB
+        expand["<b>Expand + Residue Pos. Enc.</b><br/><i>z</i><sup>B×<b>T</b>×D</sup> → <i>z</i><sup>B×<b>L</b>×D</sup> <br/> + PosEnc (<i>global</i> + <i>local</i>)"]
+        resmlp["<b>Bottleneck MLP</b><br/><i>(LN → GELU) × 2</i>"]
+        aalin["<b>Linear</b> → 20 AAs"]
+        expand --> resmlp --> aalin
+    end
+    out1(["<b style='font-size:15px'><i>r̂</i></b> ∈ <b>R</b><sup>B×L×20</sup>"])
+
+    subgraph P2 ["<b>Representation Head</b>"]
+        direction TB
+        agg["<b>Attention Aggregator</b><br/><i>Learnable query pool</i><br/><i>z</i><sup>B×T×D</sup> → <i>h</i><sup>B×D</sup>"]
+        proj["<b>Bottleneck MLP</b><br/><i>(LN → GELU) × L</i>"]
+        norm_t["<b>Linear → L2 Norm</b><br/>Linear(D → P) ÷ <i><b>τ</b><sub>learned</sub></i>"]
+        agg --> proj --> norm_t
+    end
+    out2(["<b style='font-size:15px'><i>f</i></b> ∈ <b>R</b><sup>B×P</sup>"])
+
+    %% ── Connections ──
+    input --> emb --> | RoPE | ENC
+    fnorm --> z
+    z --> expand
+    aalin --> out1
+    z --> agg
+    norm_t --> out2
+    
+
+    %% ── Styling ──
+    classDef inputNode fill:#F1F3F5,stroke:#ADB5BD,stroke-width:1.5px,color:#495057
+    classDef encNode fill:#D0EBFF,stroke:#74C0FC,stroke-width:1.5px,color:#1971C2
+    classDef blkNode fill:#DBE4FF,stroke:#91A7FF,stroke-width:1.5px,color:#3B5BDB
+    classDef p1Node fill:#D3F9D8,stroke:#69DB7C,stroke-width:1.5px,color:#2B8A3E
+    classDef p2Node fill:#FFF3BF,stroke:#FFD43B,stroke-width:1.5px,color:#E67700
+    classDef outNode fill:#E5DBFF,stroke:#B197FC,stroke-width:1.5px,color:#7048E8
+
+    class input inputNode
+    class emb,fnorm encNode
+    class mhsa,ffn blkNode
+    class expand,resmlp,aalin p1Node
+    class agg,proj,norm_t p2Node
+    class z,out1,out2 outNode
+
+    %% ── Subgraph styling ──
+    style ENC fill:#E9EEF5,opacity:0.5,stroke:#74C0FC,stroke-width:1.5px,color:#1971C2,rx:10,ry:10
+    style BLK fill:#DBE4FF,opacity:0.5,stroke:#91A7FF,stroke-width:1.5px,color:#3B5BDB,rx:8,ry:8
+    style P1 fill:#E9F5E9,opacity:0.5,stroke:#69DB7C,stroke-width:1.5px,color:#2B8A3E,rx:10,ry:10
+    style P2 fill:#FFF5E6,opacity:0.5,stroke:#FFD43B,stroke-width:1.5px,color:#E67700,rx:10,ry:10
