@@ -8,12 +8,6 @@
     'lineColor': '#868E96',
     'fontFamily': 'Inter, Helvetica Neue, Arial, sans-serif'
   },
-  'flowchart': {
-    'subGraphTitleMargin': { 'top': 3, 'bottom': 3 },
-    'padding': 16,
-    'nodeSpacing': 30,
-    'rankSpacing': 40
-  }
 }}%%
 
 flowchart LR
@@ -47,7 +41,7 @@ flowchart LR
         aalin["<b>Linear</b> → 20 AAs"]
         expand --> resmlp --> aalin
     end
-    out1(["<b style='font-size:15px'><i>r̂</i></b> ∈ <b>R</b><sup>B×L×20</sup>"])
+    out1(["<b style='font-size:15px'><i>r</i></b> ∈ <b>R</b><sup>B×L×20</sup>"])
 
     subgraph P2 ["<b>Representation Head</b>"]
         direction TB
