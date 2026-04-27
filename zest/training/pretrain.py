@@ -19,7 +19,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from zest.model.theme_encoder import create_theme_encoder
+from zest.model.theme_encoder import create_theme_encoder, ThemeEncoder
 from zest.tokenizer import ZESTTokenizer
 from zest.data.pretrain import MLMDataset, mlm_collate_fn
 from zest.training.losses import UncertaintyWeightedLoss
@@ -210,11 +210,11 @@ def main():
             torch.backends.cuda.matmul.allow_tf32 = True
             amp = True
 
-    # Determine run directory
-    if args.checkpoint:
-        run_dir = Path(args.checkpoint).parent.parent
-    elif args.run_dir:
+    # Determine run directory (explicit --run-dir takes priority)
+    if args.run_dir:
         run_dir = Path(args.run_dir)
+    elif args.checkpoint:
+        run_dir = Path(args.checkpoint).parent.parent
     else:
         run_dir = make_run_dir(args.output_dir, args.model)
 
@@ -279,7 +279,11 @@ def main():
         mask_prob=args.mask_prob,
     )
 
-    model = create_theme_encoder(args.model, tokenizer.vocab_size, args.max_tokens).to(device)
+    if args.checkpoint:
+        model, _ = ThemeEncoder.load_pretrained(args.checkpoint, device="cpu")
+        model = model.to(device)
+    else:
+        model = create_theme_encoder(args.model, tokenizer.vocab_size, args.max_tokens).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     log.info("Model: %s (%.1fM params)", args.model, total_params / 1e6)
 
