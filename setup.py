@@ -18,6 +18,11 @@ setup(
         "matplotlib>=3.8.0",
     ],
     extras_require={
+        "hf": [
+            "transformers>=4.44.0",
+            "safetensors>=0.4.0",
+            "huggingface-hub>=0.24.0",
+        ],
         "dev": [
             "pytest>=7.0.0",
         ],
