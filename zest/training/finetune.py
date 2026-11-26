@@ -16,6 +16,7 @@ import argparse
 import json
 import math
 import random
+import signal
 import time
 from pathlib import Path
 
@@ -84,9 +85,11 @@ def parse_args():
     p.add_argument("--max-tokens",       type=int,   default=512,      help="Maximum sequence length")
     p.add_argument("--num-workers",      type=int,   default=6,        help="Number of data loading workers")
     p.add_argument("--bpe-dropout",      type=float, default=0.3,      help="BPE dropout probability")
+    p.add_argument("--trie-dropout",     type=float, default=None,     help="ZEST trie dropout probability (defaults to --bpe-dropout)")
     p.add_argument("--seed",             type=int,   default=42,       help="Random seed for reproducibility")
     p.add_argument("--val-every",        type=int,   default=1,        help="Run validation every N epochs")
     p.add_argument("--val-max-batches",  type=int,   default=200,      help="Max validation batches per eval (0=all)")
+    p.add_argument("--validate-before-train", action="store_true",     help="Record retrieval and residue validation metrics before the first update")
     p.add_argument("--amp",              action="store_true",          help="Use automatic mixed precision")
     p.add_argument("--keep-all-checkpoints", action="store_true",      help="Keep all checkpoints (default: last 3)")
 
@@ -114,19 +117,30 @@ def parse_args():
     p.add_argument("--memory-bank-samples", type=int, default=4096)
     p.add_argument("--hard-neg-weight",  type=float, default=1.0)
     p.add_argument("--smooth-ap-max-samples", type=int, default=256)
+    p.add_argument("--benchmark-aligned-loss", action="store_true")
+    p.add_argument("--remote-positive-sampling", action="store_true")
+    p.add_argument("--remote-low-threshold", type=float, default=0.80)
+    p.add_argument("--remote-mid-threshold", type=float, default=0.90)
+    p.add_argument("--remote-low-weight", type=float, default=4.0)
+    p.add_argument("--remote-mid-weight", type=float, default=2.0)
 
     p.add_argument("--num-proj-layers",  type=int, default=None)
     p.add_argument("--proj-dim",         type=int, default=None)
     p.add_argument("--proj-ff-mult",     type=int, default=None)
-    p.add_argument("--domain",           default="protein", choices=["protein", "code"], help="Data domain")
-    p.add_argument("--ast-language",     default="cpp",              help="Language for AST encoder (code domain only)")
-    p.add_argument("--tokenizer-type",   default="zest", choices=["zest", "bpe", "char"], help="Tokenizer type (zest=trie, bpe=subword baseline, char=character-level)")
+    p.add_argument("--domain",           default="protein", choices=["protein"], help="Data domain")
+    p.add_argument("--tokenizer-type",   default="zest", choices=["zest", "bpe"], help="Tokenizer type (zest=trie, bpe=subword baseline)")
     p.add_argument("--residue-mlm-weight", type=float, default=0.0, help="Residue MLM auxiliary weight (0 disables)")
     p.add_argument("--ft-mask-prob",     type=float, default=0.05, help="Light masking prob for residue MLM during finetune")
+    p.add_argument("--ft-span-mask",     action="store_true", help="Mask contiguous token spans for residue MLM")
+    p.add_argument("--ft-min-span",      type=int, default=2)
+    p.add_argument("--ft-max-span",      type=int, default=5)
+    p.add_argument("--separate-mlm-view", action="store_true", help="Keep retrieval inputs clean and encode a separate masked residue view")
+    p.add_argument("--task-weighting", choices=["uncertainty", "fixed"], default="uncertainty", help="How to combine retrieval and residue losses")
     p.add_argument("--fold-balanced",    action="store_true",        help="Use fold-balanced sampling (inverse sqrt freq)")
     p.add_argument("--crop-ratio",       type=float, default=0.7,    help="Min crop ratio for augmentation (0 disables)")
     p.add_argument("--crop-prob",        type=float, default=0.0,    help="Probability of random crop per sample")
     p.add_argument("--crop-small-threshold", type=int, default=50,   help="Fold size below which crop is 3x more likely")
+    p.add_argument("--save-every-steps",  default=0, type=int,       help="Save intra-epoch checkpoint every N optimizer steps (0=epoch-only)")
     return p.parse_args()
 
 
@@ -211,79 +225,82 @@ def main():
     # Tokenizer + data
     log.info("Loading tokenizer and training data from %s ...", args.shards_dir)
     if args.tokenizer_type == "bpe":
-        if args.domain == "code":
-            from experiments.code.build_bpe_tokenizer import CodeBPETokenizer
-            tokenizer = CodeBPETokenizer(args.tokenizer)
-        else:
-            from experiments.biology.build_protein_bpe_tokenizer import ProteinBPETokenizer
-            tokenizer = ProteinBPETokenizer(args.tokenizer)
+        from zest.tokenizer_bpe import ProteinBPETokenizer
+        tokenizer = ProteinBPETokenizer(args.tokenizer)
         log.info("Using BPE tokenizer: vocab_size=%d", tokenizer.vocab_size)
-    elif args.tokenizer_type == "char":
-        from experiments.biology.char_tokenizer import CharTokenizer
-        tokenizer = CharTokenizer()
-        log.info("Using char tokenizer: vocab_size=%d", tokenizer.vocab_size)
     else:
         tokenizer = ZESTTokenizer(args.tokenizer)
 
-    # Build domain-specific encoder for code
     encoder = None
     encoder_cfg = {"tokenizer_type": args.tokenizer_type, "domain": args.domain}
-    if args.domain == "code":
-        if args.tokenizer_type == "bpe":
-            from experiments.code.build_bpe_tokenizer import make_bpe_encoder
-            encoder = make_bpe_encoder(args.tokenizer, args.ast_language)
-            encoder_cfg.update({"language": args.ast_language})
-            log.info("Code domain: BPE encoder for %s (comment-stripped)", args.ast_language)
-        else:
-            from experiments.code.build_role_tokenizer import make_role_encoder
-            encoder = make_role_encoder(args.ast_language)
-            encoder_cfg.update({"language": args.ast_language, "dropout": args.bpe_dropout})
-            log.info("Code domain: role encoder for %s (dropout=%.2f)",
-                     args.ast_language, args.bpe_dropout)
 
     residue_mlm = args.residue_mlm_weight > 0 and args.domain == "protein"
+    # Residue arrays are indexed into m.global_pos_emb, whose row count comes
+    # from the pretrained checkpoint (3 * pretrain max_tokens), not from
+    # --max-tokens here.
+    max_residues = m.max_residues
+    if residue_mlm:
+        log.info("Residue MLM: max_tokens=%d, residue budget=%d",
+                 args.max_tokens, max_residues)
+    tokenizer_dropout = (args.trie_dropout if args.tokenizer_type == "zest"
+                         and args.trie_dropout is not None else args.bpe_dropout)
     train_ds = HierarchicalPairDataset(
         args.shards_dir, tokenizer, max_tokens=args.max_tokens,
-        shards_per_epoch=args.shards_per_epoch, bpe_dropout=args.bpe_dropout,
+        shards_per_epoch=args.shards_per_epoch, bpe_dropout=tokenizer_dropout,
         encoder=encoder, encoder_cfg=encoder_cfg,
         residue_mlm=residue_mlm,
         crop_ratio=args.crop_ratio, crop_prob=args.crop_prob,
         crop_small_threshold=args.crop_small_threshold,
+        max_residues=max_residues,
     )
     val_ds = None
     ft_mask_prob = args.ft_mask_prob if residue_mlm else 0.0
     collate = lambda b: finetune_collate_fn(
         b, tokenizer.pad_id, mask_id=tokenizer.mask_id,
-        vocab_size=tokenizer.vocab_size, mask_prob=ft_mask_prob)
+        vocab_size=tokenizer.vocab_size, mask_prob=ft_mask_prob,
+        span_mask=args.ft_span_mask, min_span=args.ft_min_span,
+        max_span=args.ft_max_span, separate_mlm_view=args.separate_mlm_view)
 
     bs, ga = args.batch_size, args.grad_accum_steps
     nw = args.num_workers
     pf = 6 if nw > 0 else None
     loader_gen = torch.Generator()
     loader_gen.manual_seed(args.seed)
+    val_loader_gen = torch.Generator()
+    val_loader_gen.manual_seed(args.seed + 10000)
 
-    def make_loader(ds, shuffle=True, drop_last=True, sampler=None):
+    def make_loader(ds, shuffle=True, drop_last=True, sampler=None, generator=None):
         return DataLoader(
             ds, bs, shuffle=(shuffle and sampler is None), sampler=sampler,
             num_workers=nw,
             pin_memory=True, collate_fn=collate, drop_last=drop_last,
-            worker_init_fn=_seed_worker, generator=loader_gen,
+            worker_init_fn=_seed_worker, generator=generator or loader_gen,
             prefetch_factor=pf if nw > 0 else None,
         )
 
-    # Fold-balanced sampling
-    train_sampler = None
-    if args.fold_balanced:
-        weights = train_ds.get_sample_weights()
-        train_sampler = WeightedRandomSampler(
-            weights, len(weights), replacement=True, generator=loader_gen)
-        log.info("Fold-balanced sampling enabled (%d weights)", len(weights))
+    def make_train_loader():
+        sampler = None
+        if args.fold_balanced or args.remote_positive_sampling:
+            weights = train_ds.get_sample_weights(
+                fold_balanced=args.fold_balanced,
+                remote_positive=args.remote_positive_sampling,
+                remote_low_threshold=args.remote_low_threshold,
+                remote_mid_threshold=args.remote_mid_threshold,
+                remote_low_weight=args.remote_low_weight,
+                remote_mid_weight=args.remote_mid_weight,
+            )
+            sampler = WeightedRandomSampler(
+                weights, len(weights), replacement=True, generator=loader_gen)
+        return make_loader(train_ds, sampler=sampler)
 
-    # Uncertainty weighting for residue MLM
+    if args.fold_balanced or args.remote_positive_sampling:
+        log.info("Weighted sampling enabled: fold_balanced=%s remote_positive=%s",
+                 args.fold_balanced, args.remote_positive_sampling)
+
     combine_loss = None
-    if residue_mlm:
+    if residue_mlm and args.task_weighting == "uncertainty":
         combine_loss = UncertaintyWeightedLoss(num_tasks=2).to(device)
-        args.combine_loss = combine_loss
+    args.combine_loss = combine_loss
 
     # Optimizer
     encoder_lr = args.lr * args.encoder_lr_scale
@@ -306,7 +323,7 @@ def main():
     proj_dim = m.proj_dim
     memory_bank = MemoryBank(args.memory_bank_size, proj_dim, device) if args.memory_bank_size > 0 else None
 
-    loader = make_loader(train_ds, sampler=train_sampler)
+    loader = make_train_loader()
     val_loader = None
 
     steps_ep = max(1, len(loader) // ga)
@@ -336,11 +353,26 @@ def main():
         "max_tokens": args.max_tokens,
         "unfreeze_layers": args.unfreeze_layers,
         "contrastive_weight": args.contrastive_weight,
+        "residue_mlm_weight": args.residue_mlm_weight,
+        "task_weighting": args.task_weighting,
+        "ft_mask_prob": args.ft_mask_prob,
+        "ft_span_mask": args.ft_span_mask,
+        "ft_span": [args.ft_min_span, args.ft_max_span],
+        "separate_mlm_view": args.separate_mlm_view,
+        "tokenizer_dropout": tokenizer_dropout,
         "cross_level_weight": args.cross_level_weight,
         "smooth_ap_weight": args.smooth_ap_weight,
         "rank_weight": args.rank_weight,
         "memory_bank_size": args.memory_bank_size,
         "hard_neg_weight": args.hard_neg_weight,
+        "benchmark_aligned_loss": args.benchmark_aligned_loss,
+        "remote_positive_sampling": args.remote_positive_sampling,
+        "remote_sampling": {
+            "low_threshold": args.remote_low_threshold,
+            "mid_threshold": args.remote_mid_threshold,
+            "low_weight": args.remote_low_weight,
+            "mid_weight": args.remote_mid_weight,
+        },
         "seed": args.seed,
         "amp": amp,
     }
@@ -355,21 +387,97 @@ def main():
     global_step = 0
     if args.resume:
         ckpt = ckpt_mgr.load(args.resume, model, opt, sched, map_location=device)
-        start_epoch = ckpt.get("epoch", 0) + 1
+        if ckpt.get("intra_epoch", False):
+            start_epoch = ckpt.get("epoch", 1)
+            log.info("Resuming intra-epoch checkpoint (epoch %d, step %d) \u2014 "
+                     "restarting epoch with preserved optimizer state",
+                     start_epoch, ckpt.get("global_step", 0))
+        else:
+            start_epoch = ckpt.get("epoch", 0) + 1
         global_step = ckpt.get("global_step", 0)
         log.info("Resumed from %s (epoch %d, best_val=%.4f)",
                  args.resume, start_epoch - 1, ckpt_mgr.best_val_loss)
+
+        # A resumed checkpoint past --epochs would silently train nothing and
+        # report "complete", burning an allocation for no work.
+        if start_epoch > args.epochs:
+            raise SystemExit(
+                f"Nothing to do: checkpoint is at epoch {start_epoch - 1} but "
+                f"--epochs is {args.epochs}. Raise --epochs (or use a fresh "
+                f"--run-dir) before submitting.")
+
+    # Graceful shutdown on SIGTERM (e.g. SLURM job timeout)
+    _shutdown_requested = False
+    def _sigterm_handler(signum, frame):
+        nonlocal _shutdown_requested
+        _shutdown_requested = True
+        log.info("SIGTERM received \u2014 will save checkpoint and exit after current step")
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
     log.info("Starting training: %d epochs, BS=%d, GA=%d, LR=%.2e (encoder=%.2e)",
              args.epochs, bs, ga, args.lr, encoder_lr)
 
     METRIC_KEYS = get_metric_keys(args.domain)
 
+    def run_validation():
+        nonlocal val_ds, val_loader
+        if val_loader is None:
+            log.info("Loading validation dataset from %s ...", args.val_shards_dir)
+            val_ds = HierarchicalPairDataset(
+                args.val_shards_dir, tokenizer, max_tokens=args.max_tokens,
+                encoder=encoder, encoder_cfg=dict(encoder_cfg),
+                residue_mlm=residue_mlm, max_residues=max_residues,
+            )
+            val_loader = make_loader(val_ds, shuffle=False, drop_last=False,
+                                     generator=val_loader_gen)
+        val_loader_gen.manual_seed(args.seed + 10000)
+        max_batches = args.val_max_batches if args.val_max_batches > 0 else None
+        log.info("Running validation (max_batches=%s) ...", max_batches or "all")
+        started = time.time()
+        model.eval()
+        totals = {key: 0.0 for key in METRIC_KEYS}
+        count = 0
+        for batch in val_loader:
+            try:
+                metrics = eval_step(batch, model, device, amp, args)
+            except RuntimeError as error:
+                if _is_oom(error):
+                    torch.cuda.empty_cache()
+                    continue
+                raise
+            for key in METRIC_KEYS:
+                totals[key] += metrics[key].item()
+            count += 1
+            if max_batches and count >= max_batches:
+                break
+        return ({key: value / max(1, count) for key, value in totals.items()},
+                time.time() - started)
+
+    baseline_metrics = None
+    baseline_path = ckpt_mgr.run_dir / "validation_baseline.json"
+    if args.validate_before_train and args.val_shards_dir:
+        if baseline_path.exists():
+            baseline_metrics = json.loads(baseline_path.read_text())
+            baseline_elapsed = 0.0
+            log.info("Loaded original validation baseline from %s", baseline_path)
+        else:
+            baseline_metrics, baseline_elapsed = run_validation()
+            baseline_path.write_text(json.dumps(
+                {key: round(value, 6) for key, value in baseline_metrics.items()},
+                indent=2))
+        log.info("Initial validation [%.0fs] loss=%.4f con=%.4f acc_h=%.4f "
+                 "res_loss=%.4f res_acc=%.3f", baseline_elapsed,
+                 baseline_metrics["loss"], baseline_metrics["con"],
+                 baseline_metrics["acc_h"], baseline_metrics["res_loss"],
+                 baseline_metrics["res_acc"])
+
     core_fully_frozen = not any(p.requires_grad for p in m.core.parameters())
 
     for ep in range(start_epoch, args.epochs + 1):
         if hasattr(train_ds, "set_epoch"):
             train_ds.set_epoch(ep)
+        loader_gen.manual_seed(args.seed + ep)
+        loader = make_train_loader()
         # --- Train ---
         t0 = time.time()
         model.train()
@@ -418,6 +526,21 @@ def main():
                 opt.zero_grad(set_to_none=True)
                 global_step += 1
 
+                # Intra-epoch checkpoint
+                if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+                    log.info("Saving intra-epoch checkpoint at step %d "
+                             "(epoch %d, batch %d/%d)",
+                             global_step, ep, i + 1, len(loader))
+                    ckpt_mgr.save_step(model, opt, sched, ep, global_step)
+
+                # Graceful shutdown
+                if _shutdown_requested:
+                    log.info("Saving checkpoint before shutdown (step %d)...",
+                             global_step)
+                    ckpt_mgr.save_step(model, opt, sched, ep, global_step)
+                    log.info("Checkpoint saved. Exiting.")
+                    return
+
         train_elapsed = time.time() - t0
         t_metrics = {k: v / max(1, n_steps) for k, v in acc.items()}
         log.info("Epoch %d training done in %.0fs (%d steps)", ep, train_elapsed, n_steps)
@@ -426,34 +549,7 @@ def main():
         v_metrics = None
         val_elapsed = 0.0
         if args.val_shards_dir and (ep % args.val_every == 0 or ep == args.epochs):
-            if val_loader is None:
-                log.info("Loading validation dataset from %s ...", args.val_shards_dir)
-                val_ds = HierarchicalPairDataset(
-                    args.val_shards_dir, tokenizer, max_tokens=args.max_tokens,
-                    encoder=encoder, encoder_cfg=encoder_cfg,
-                )
-                val_loader = make_loader(val_ds, shuffle=False, drop_last=False)
-            max_vb = args.val_max_batches if args.val_max_batches > 0 else None
-            log.info("Running validation (max_batches=%s) ...", max_vb or "all")
-            t1 = time.time()
-            model.eval()
-            v_acc = {k: 0.0 for k in METRIC_KEYS}
-            vn = 0
-            for batch in val_loader:
-                try:
-                    vm = eval_step(batch, model, device, amp, args)
-                except RuntimeError as e:
-                    if _is_oom(e):
-                        torch.cuda.empty_cache()
-                        continue
-                    raise
-                for k in METRIC_KEYS:
-                    v_acc[k] += vm[k].item()
-                vn += 1
-                if max_vb and vn >= max_vb:
-                    break
-            val_elapsed = time.time() - t1
-            v_metrics = {k: v / max(1, vn) for k, v in v_acc.items()}
+            v_metrics, val_elapsed = run_validation()
 
         # Log
         current_lr = sched.get_last_lr()[0]
@@ -480,6 +576,9 @@ def main():
                         f" val_acc_h={v_metrics['acc_h']:.4f}")
                 if v_metrics.get('res_loss', 0) > 0:
                     msg += f" val_res_acc={v_metrics['res_acc']:.3f}"
+                if baseline_metrics:
+                    msg += (f" | delta_con={v_metrics['con'] - baseline_metrics['con']:+.4f}"
+                            f" delta_res={v_metrics['res_loss'] - baseline_metrics['res_loss']:+.4f}")
         log.info(msg)
 
         # Save checkpoint + metrics

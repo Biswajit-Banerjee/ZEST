@@ -19,7 +19,8 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
-from zest.data.pretrain import AA_TO_IDX, AA_SANITIZE
+from zest.data.pretrain import (AA_TO_IDX, AA_SANITIZE, _gate_aa_labels,
+                                _sample_span_mask, _truncate_to_residues)
 
 _log = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ def _tokenize_chunk(args):
     Each worker reconstructs a lightweight tokenizer from ``tok_path`` so
     the trie lives in the child process (no pickle of the full object).
     """
-    chunk, tok_path, max_tokens, dropout, seed, encoder_cfg = args
+    chunk, tok_path, max_tokens, dropout, seed, encoder_cfg, max_residues = args
     random.seed(seed)
 
     cfg = encoder_cfg or {}
@@ -38,25 +39,13 @@ def _tokenize_chunk(args):
     domain = cfg.get("domain", "protein")
 
     if tok_type == "bpe":
-        if domain == "code":
-            from experiments.code.build_bpe_tokenizer import CodeBPETokenizer, make_bpe_encoder
-            tok = CodeBPETokenizer(tok_path)
-            encoder = make_bpe_encoder(tok_path, cfg.get("language", "c"))
-        else:
-            from experiments.biology.build_protein_bpe_tokenizer import ProteinBPETokenizer
-            tok = ProteinBPETokenizer(tok_path)
-            encoder = None
-    elif tok_type == "char":
-        from experiments.biology.char_tokenizer import CharTokenizer
-        tok = CharTokenizer()
+        from zest.tokenizer_bpe import ProteinBPETokenizer
+        tok = ProteinBPETokenizer(tok_path)
         encoder = None
     else:
         from zest.tokenizer import ZESTTokenizer
         tok = ZESTTokenizer(tok_path)
         encoder = None
-        if domain == "code" and "language" in cfg:
-            from experiments.code.build_role_tokenizer import make_role_encoder
-            encoder = make_role_encoder(cfg["language"])
 
     residue_mlm = cfg.get("residue_mlm", False)
 
@@ -77,6 +66,7 @@ def _tokenize_chunk(args):
             segments = tok._segment(symbols, dropout)
             if max_tokens and len(segments) > max_tokens:
                 segments = segments[:max_tokens]
+            segments = _truncate_to_residues(segments, max_residues)
             token_ids = [tid for _, tid in segments]
             token_lengths = [length for length, _ in segments]
             n_residues = sum(token_lengths)
@@ -116,9 +106,14 @@ class HierarchicalPairDataset(Dataset):
                  encoder_cfg: Optional[Dict] = None, residue_mlm: bool = False,
                  crop_ratio: float = 0.0, crop_prob: float = 0.0,
                  crop_small_threshold: int = 50,
+                 max_residues: Optional[int] = None,
+                 profile_map_path: Optional[str] = None,
                  **kwargs):
         self.tokenizer = tokenizer
         self.max_tokens = max_tokens
+        # See MLMDataset.max_residues: bounds the residue-MLM arrays to what
+        # ThemeEncoder.global_pos_emb can index.
+        self.max_residues = max_residues if max_residues is not None else 3 * max_tokens
         self.seed = seed
         self.bpe_dropout = bpe_dropout
         self._encoder = encoder
@@ -130,6 +125,17 @@ class HierarchicalPairDataset(Dataset):
         self.crop_prob = crop_prob
         self.crop_small_threshold = crop_small_threshold
         self._epoch = 0
+
+        # Profile-level labels (optional, for 4-level hierarchy)
+        self.has_profiles = False
+        self._domain_to_profile = None
+        if profile_map_path and os.path.exists(profile_map_path):
+            with open(profile_map_path, "rb") as f:
+                profile_data = pickle.load(f)
+            self._domain_to_profile = profile_data["domain_to_profile"]
+            self.has_profiles = True
+            _log.info("Loaded profile map: %d domain→profile mappings",
+                      len(self._domain_to_profile))
 
         self.shard_paths = sorted(glob.glob(os.path.join(shards_dir, "*.parquet")))
         if not self.shard_paths:
@@ -238,8 +244,42 @@ class HierarchicalPairDataset(Dataset):
         self._probabilities = np.concatenate([r[8] for r in results])
         self._shard_ids = np.concatenate([r[9] for r in results])
 
+        # Assign profile labels if profile map is loaded
+        if self.has_profiles:
+            self._assign_profile_labels()
+
         _log.info("Pre-loaded %d pairs from %d shards in %.1fs (%d threads)",
                   len(self._q_idx), self.num_shards, time.time() - t0, workers)
+
+    def _assign_profile_labels(self):
+        """Assign integer profile labels to each pair from the domain→profile map.
+
+        Uses Query_ID / Template_ID stored in parquet. Since _preload_pairs
+        maps everything through seq_map index, we need the original IDs.
+        We re-derive them from the sorted seq_map keys.
+        """
+        sorted_keys = sorted(self.seq_map.keys())
+        n_pairs = len(self._q_idx)
+        p_labels = np.full(n_pairs, -1, dtype=np.int32)
+        p_pos_labels = np.full(n_pairs, -1, dtype=np.int32)
+
+        for i in range(n_pairs):
+            q_key = sorted_keys[self._q_idx[i]]
+            t_key = sorted_keys[self._t_idx[i]]
+            q_prof = self._domain_to_profile.get(q_key, -1)
+            t_prof = self._domain_to_profile.get(t_key, -1)
+            p_labels[i] = q_prof
+            p_pos_labels[i] = t_prof
+
+        self._p_labels = p_labels
+        self._p_pos_labels = p_pos_labels
+
+        n_mapped = int((p_labels >= 0).sum())
+        n_both = int(((p_labels >= 0) & (p_pos_labels >= 0)).sum())
+        n_same = int((p_labels == p_pos_labels).sum()) - int(((p_labels == -1) & (p_pos_labels == -1)).sum())
+        _log.info("Profile labels: %d/%d query mapped, %d/%d both mapped, "
+                  "%d same-profile pairs",
+                  n_mapped, n_pairs, n_both, n_pairs, n_same)
 
     # ------------------------------------------------------------------
     # Per-epoch pre-tokenisation (parallel, preserves BPE dropout)
@@ -268,7 +308,8 @@ class HierarchicalPairDataset(Dataset):
                 start = end
             args = [
                 (chunk, tok_path, self.max_tokens, dropout,
-                 self.seed + self._epoch + i, self._encoder_cfg)
+                 self.seed + self._epoch + i, self._encoder_cfg,
+                 self.max_residues)
                 for i, chunk in enumerate(chunks)
             ]
             with Pool(workers) as pool:
@@ -280,9 +321,26 @@ class HierarchicalPairDataset(Dataset):
             for idx, seq in seqs_to_tok:
                 if self._encoder is not None:
                     ids = self._encoder(seq)
+                elif self.residue_mlm and hasattr(self.tokenizer, "_segment"):
+                    text = self.tokenizer._ws.sub("", seq).upper()
+                    segments = self.tokenizer._segment(list(text), dropout)
+                    if self.max_tokens and len(segments) > self.max_tokens:
+                        segments = segments[:self.max_tokens]
+                    segments = _truncate_to_residues(segments, self.max_residues)
+                    token_lengths = [length for length, _ in segments]
+                    n_residues = sum(token_lengths)
+                    ids = {
+                        "ids": [token_id for _, token_id in segments],
+                        "token_lengths": token_lengths,
+                        "aa_labels": [
+                            AA_TO_IDX.get(AA_SANITIZE.get(aa, aa), 0)
+                            for aa in text[:n_residues]
+                        ],
+                    }
                 else:
                     ids = self.tokenizer.encode(seq, dropout=dropout)
-                if self.max_tokens and len(ids) > self.max_tokens:
+                if (not isinstance(ids, dict) and self.max_tokens
+                        and len(ids) > self.max_tokens):
                     ids = ids[:self.max_tokens]
                 self._token_cache[idx] = ids
 
@@ -316,18 +374,30 @@ class HierarchicalPairDataset(Dataset):
     # Fold-balanced sampling
     # ------------------------------------------------------------------
 
-    def get_sample_weights(self, min_fold_freq: int = 10):
-        """Per-pair weights for fold-balanced sampling (clamped inverse sqrt).
-
-        Folds below ``min_fold_freq`` pairs are clamped so singletons and
-        near-singletons don't get extreme oversampling that leads to
-        overfitting on the same few pairs.
-        """
-        from collections import Counter
-        active_folds = self._t_labels[self._active]
-        fold_counts = Counter(active_folds.tolist())
-        weights = np.array([1.0 / np.sqrt(max(fold_counts[t], min_fold_freq))
-                            for t in active_folds], dtype=np.float64)
+    def get_sample_weights(self, min_fold_freq: int = 10,
+                           fold_balanced: bool = True,
+                           remote_positive: bool = False,
+                           remote_low_threshold: float = 0.80,
+                           remote_mid_threshold: float = 0.90,
+                           remote_low_weight: float = 4.0,
+                           remote_mid_weight: float = 2.0):
+        weights = np.ones(len(self._active), dtype=np.float64)
+        if fold_balanced:
+            from collections import Counter
+            active_folds = self._t_labels[self._active]
+            fold_counts = Counter(active_folds.tolist())
+            weights *= np.array([
+                1.0 / np.sqrt(max(fold_counts[t], min_fold_freq))
+                for t in active_folds
+            ], dtype=np.float64)
+        if remote_positive:
+            probabilities = self._probabilities[self._active]
+            weights *= np.where(
+                probabilities < remote_low_threshold,
+                remote_low_weight,
+                np.where(probabilities < remote_mid_threshold,
+                         remote_mid_weight, 1.0),
+            )
         weights /= weights.sum()
         return torch.from_numpy(weights).double()
 
@@ -416,13 +486,18 @@ class HierarchicalPairDataset(Dataset):
             "h_pos_label": int(self._h_pos_labels[real]),
             "probability": float(self._probabilities[real]),
         })
+        if self.has_profiles:
+            item["p_label"] = int(self._p_labels[real])
+            item["p_pos_label"] = int(self._p_pos_labels[real])
         return item
 
 
 def finetune_collate_fn(batch: List[Dict], pad_id: int = 0,
                         mask_id: int = 4, vocab_size: int = 32000,
-                        mask_prob: float = 0.0):
-    """Collate anchor/positive pairs into padded tensors with optional light masking."""
+                        mask_prob: float = 0.0, span_mask: bool = False,
+                        min_span: int = 2, max_span: int = 5,
+                        separate_mlm_view: bool = False):
+    """Collate anchor/positive pairs with optional clean and masked views."""
     def _pad(seqs):
         max_len = max(len(s) for s in seqs)
         ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long)
@@ -433,24 +508,32 @@ def finetune_collate_fn(batch: List[Dict], pad_id: int = 0,
         return ids, mask
 
     def _mask_tokens(ids, attn_mask):
-        """BERT-style light masking for auxiliary MLM."""
         masked = ids.clone()
         labels = torch.full_like(ids, -100)
-        prob = torch.full(ids.shape, mask_prob).masked_fill_(~attn_mask.bool(), 0.0)
-        to_mask = torch.bernoulli(prob).bool()
+        if span_mask:
+            to_mask = _sample_span_mask(attn_mask.bool(), mask_prob,
+                                        min_span, max_span)
+        else:
+            prob = torch.full(ids.shape, mask_prob).masked_fill_(
+                ~attn_mask.bool(), 0.0)
+            to_mask = torch.bernoulli(prob).bool()
         replace = torch.bernoulli(torch.full(ids.shape, 0.8)).bool() & to_mask
         masked[replace] = mask_id
         rand_pos = torch.bernoulli(torch.full(ids.shape, 0.5)).bool() & to_mask & ~replace
         masked[rand_pos] = torch.randint(2, vocab_size, ids.shape)[rand_pos]
         labels[to_mask] = ids[to_mask]
-        return masked, labels
+        return masked, labels, to_mask
 
     anc_ids, anc_mask = _pad([b["anchor_ids"] for b in batch])
     pos_ids, pos_mask = _pad([b["positive_ids"] for b in batch])
+    anc_to_mask = pos_to_mask = None
 
     if mask_prob > 0:
-        anc_ids, anc_tok_labels = _mask_tokens(anc_ids, anc_mask)
-        pos_ids, pos_tok_labels = _mask_tokens(pos_ids, pos_mask)
+        anc_mlm_ids, anc_tok_labels, anc_to_mask = _mask_tokens(anc_ids, anc_mask)
+        pos_mlm_ids, pos_tok_labels, pos_to_mask = _mask_tokens(pos_ids, pos_mask)
+        if not separate_mlm_view:
+            anc_ids = anc_mlm_ids
+            pos_ids = pos_mlm_ids
 
     out = {
         "anchor_ids": anc_ids,
@@ -466,26 +549,36 @@ def finetune_collate_fn(batch: List[Dict], pad_id: int = 0,
         "probabilities": torch.tensor([b["probability"] for b in batch], dtype=torch.float32),
     }
 
+    if "p_label" in batch[0]:
+        out["p_labels"] = torch.tensor([b["p_label"] for b in batch], dtype=torch.long)
+        out["p_pos_labels"] = torch.tensor([b["p_pos_label"] for b in batch], dtype=torch.long)
+
     if mask_prob > 0:
         out["anchor_token_labels"] = anc_tok_labels
         out["positive_token_labels"] = pos_tok_labels
+        if separate_mlm_view:
+            out["anchor_mlm_ids"] = anc_mlm_ids
+            out["positive_mlm_ids"] = pos_mlm_ids
 
     if "anchor_token_lengths" in batch[0]:
-        for prefix, key_prefix in [("anchor", "anchor"), ("positive", "positive")]:
+        token_masks = {"anchor": anc_to_mask, "positive": pos_to_mask}
+        for prefix in ("anchor", "positive"):
             tl = pad_sequence(
                 [torch.tensor(b[f"{prefix}_token_lengths"], dtype=torch.long) for b in batch],
                 batch_first=True, padding_value=0)
             aa = pad_sequence(
                 [torch.tensor(b[f"{prefix}_aa_labels"], dtype=torch.long) for b in batch],
                 batch_first=True, padding_value=-100)
-            B = tl.shape[0]
+            if token_masks[prefix] is not None:
+                _gate_aa_labels(token_masks[prefix], tl, aa)
+            batch_size = tl.shape[0]
             max_res = int(tl.sum(dim=1).max().item())
-            gi = torch.zeros(B, max_res, dtype=torch.long)
-            for i in range(B):
+            gi = torch.zeros(batch_size, max_res, dtype=torch.long)
+            for i in range(batch_size):
                 n = int(tl[i].sum().item())
                 gi[i, :n] = torch.arange(n)
-            out[f"{key_prefix}_token_lengths"] = tl
-            out[f"{key_prefix}_aa_labels"] = aa
-            out[f"{key_prefix}_global_indices"] = gi
+            out[f"{prefix}_token_lengths"] = tl
+            out[f"{prefix}_aa_labels"] = aa
+            out[f"{prefix}_global_indices"] = gi
 
     return out
