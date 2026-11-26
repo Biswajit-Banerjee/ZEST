@@ -54,7 +54,9 @@ tags:
 
 # LEMON-ZEST
 
-**LEMON** (*Layered Extraction of Molecular Ordering from Nature*) paired with **ZEST** (*Zoned Encoding of Sequence Themes*) — a 200M-parameter motif-tokenized protein language model for fast remote homology retrieval and iterative per-residue sequence/structure decoding.
+> **Accepted at NeurIPS 2026** · [Paper (arXiv:2609.37675)](https://arxiv.org/abs/2609.37675) · [NeurIPS 2026 Poster](https://neurips.cc/virtual/2026/loc/atlanta/poster/153755)
+
+**LEMON** (*Layered Extraction of Molecular Ordering from Nature*) paired with **ZEST** (*Zoned Encoding of Sequence Traits*) — a 200M-parameter motif-tokenized protein language model for fast remote homology retrieval and iterative per-residue sequence/structure decoding.
 
 ## Quick Start
 
@@ -93,6 +95,21 @@ features = extractor("MKTLLLTLVVVTIVCLDLGYT")
 ### Optional Rust Tokenizer Acceleration
 
 `LemonTokenizer` automatically uses the flat-array Rust trie backend when `zest-tokenizer` is installed (and falls back seamlessly to pure Python otherwise).
+
+## Citation
+
+```bibtex
+@inproceedings{banerjee2026lemonzest,
+  title     = {LEMON-ZEST: Evolution-Informed Tokenization for Efficient Protein Language Modeling},
+  author    = {Banerjee, Biswajit and Carreno, Claudia Alvarez and Petrov, Anton S.},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2026},
+  eprint    = {2609.37675},
+  archivePrefix = {arXiv},
+  primaryClass  = {q-bio.BM},
+  url       = {https://arxiv.org/abs/2609.37675}
+}
+```
 """
 
 
