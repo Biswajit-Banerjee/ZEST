@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "zest-tokenizer"
+version = "0.2.0"
+description = "Fast Rust trie tokenizer for LEMON-ZEST protein language models"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
