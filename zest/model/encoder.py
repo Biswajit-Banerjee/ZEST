@@ -89,14 +89,15 @@ class Encoder(nn.Module):
     def __init__(self, vocab_size: int = 32000, embed_dim: int = 256,
                  num_layers: int = 4, nhead: int = 8, ff_mult: int = 4,
                  dropout: float = 0.1, max_tokens: int = 1024,
-                 padding_idx: int = 0, rope_scaling_type: str | None = "linear"):
+                 padding_idx: int = 0, rope_scaling_type: str | None = "linear",
+                 embedding_dropout: float | None = None):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_layers = num_layers
         self.gradient_checkpointing = False
 
         self.token_emb = nn.Embedding(vocab_size, embed_dim, padding_idx=padding_idx)
-        self.emb_dropout = nn.Dropout(dropout)
+        self.emb_dropout = nn.Dropout(dropout if embedding_dropout is None else embedding_dropout)
         self.rope = RoPE(embed_dim // nhead, max_tokens, scaling_type=rope_scaling_type)
         self.layers = nn.ModuleList([
             AttentionBlock(embed_dim, nhead, ff_mult, dropout) for _ in range(num_layers)

@@ -27,11 +27,6 @@ Usage:
     tok = ZESTTokenizer("vocab_map.json")  # defaults to amino acid alphabet
     ids = tok.encode("ACDEFGHIKLMNPQRSTVWY")
 
-    # Code convenience — raw source code with an encoder
-    from experiments.code.build_tokenizer import lex_function
-    tok = ZESTTokenizer("vocab_map.json", alphabet_path="alphabet.json")
-    ids = tok.encode("def foo(x): return x", encoder=lambda s: lex_function(s, "python"))
-
     # Or pre-extract symbols yourself
     symbols = my_custom_encoder(raw_input)
     ids = tok.encode_symbols(symbols)

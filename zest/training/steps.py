@@ -69,6 +69,17 @@ def _encode_pair_batch_with_embs(model, anc_tok, anc_mask, pos_tok, pos_mask):
     return proj_a, proj_p, emb_a, emb_p
 
 
+def _encode_pair_token_embs(model, anc_tok, anc_mask, pos_tok, pos_mask):
+    m = _get_model(model)
+    if anc_tok.shape[1] == pos_tok.shape[1]:
+        tokens = torch.cat([anc_tok, pos_tok], dim=0)
+        mask = torch.cat([anc_mask, pos_mask], dim=0)
+        embs = m.encode_tokens(tokens, mask)
+        batch_size = anc_tok.shape[0]
+        return embs[:batch_size], embs[batch_size:]
+    return m.encode_tokens(anc_tok, anc_mask), m.encode_tokens(pos_tok, pos_mask)
+
+
 def _compute_residue_mlm(model, token_embs, batch, device, prefix):
     """Compute residue-level MLM loss from token embeddings."""
     m = _get_model(model)
@@ -81,12 +92,12 @@ def _compute_residue_mlm(model, token_embs, batch, device, prefix):
 
     logits_flat = residue_logits.reshape(-1, residue_logits.size(-1))
     labels_flat = aa_labels.reshape(-1)
-    loss = F.cross_entropy(logits_flat, labels_flat, ignore_index=-100)
-
     valid = labels_flat != -100
-    if valid.sum() > 0:
+    if valid.any():
+        loss = F.cross_entropy(logits_flat[valid], labels_flat[valid])
         acc = (logits_flat[valid].argmax(-1) == labels_flat[valid]).float().mean()
     else:
+        loss = logits_flat.sum() * 0.0
         acc = torch.tensor(0.0, device=device)
     return loss, acc
 
@@ -111,8 +122,16 @@ def _compute_losses_protein(model, batch, device, amp, args, memory_bank=None):
     has_residue = "anchor_token_lengths" in batch
     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
         if has_residue and getattr(args, "residue_mlm_weight", 0) > 0:
-            anc_proj, pos_proj, anc_embs, pos_embs = _encode_pair_batch_with_embs(
-                model, anc_tok, anc_mask, pos_tok, pos_mask)
+            if getattr(args, "separate_mlm_view", False):
+                anc_proj, pos_proj = _encode_pair_batch(
+                    model, anc_tok, anc_mask, pos_tok, pos_mask)
+                anc_mlm = batch["anchor_mlm_ids"].to(device, non_blocking=True)
+                pos_mlm = batch["positive_mlm_ids"].to(device, non_blocking=True)
+                anc_embs, pos_embs = _encode_pair_token_embs(
+                    model, anc_mlm, anc_mask, pos_mlm, pos_mask)
+            else:
+                anc_proj, pos_proj, anc_embs, pos_embs = _encode_pair_batch_with_embs(
+                    model, anc_tok, anc_mask, pos_tok, pos_mask)
         else:
             anc_proj, pos_proj = _encode_pair_batch(model, anc_tok, anc_mask, pos_tok, pos_mask)
 
@@ -153,6 +172,7 @@ def _compute_losses_protein(model, batch, device, amp, args, memory_bank=None):
                 mem_t=mem[2] if mem else None,
                 mem_h=mem[3] if mem else None,
                 hard_neg_weight=args.hard_neg_weight,
+                benchmark_aligned=getattr(args, "benchmark_aligned_loss", False),
             )
         else:
             infonce = {"loss": torch.tensor(0.0, device=device)}
@@ -167,6 +187,11 @@ def _compute_losses_protein(model, batch, device, amp, args, memory_bank=None):
                 all_emb, all_a, all_t, all_h,
                 temp_a=temp_a, temp_t=temp_t, temp_h=temp_h,
                 weight_a=cw_a, weight_t=cw_t, weight_h=0.0,
+                mem_emb=mem[0] if mem else None,
+                mem_a=mem[1] if mem else None,
+                mem_t=mem[2] if mem else None,
+                mem_h=mem[3] if mem else None,
+                benchmark_aligned=getattr(args, "benchmark_aligned_loss", False),
             )
 
         # SmoothAP
@@ -177,6 +202,7 @@ def _compute_losses_protein(model, batch, device, amp, args, memory_bank=None):
                 temp=args.smooth_ap_temp,
                 max_samples=args.smooth_ap_max_samples,
                 weight_a=args.weight_a, weight_t=args.weight_t, weight_h=args.weight_h,
+                benchmark_aligned=getattr(args, "benchmark_aligned_loss", False),
             )
 
         # Margin ranking

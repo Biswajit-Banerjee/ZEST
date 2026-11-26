@@ -46,15 +46,28 @@ class MLMDataset(Dataset):
                  unique_shards: bool = False,
                  seed: int = 42,
                  encoder: Optional[callable] = None,
-                 residue_mlm: bool = False):
+                 residue_mlm: bool = False,
+                 max_residues: Optional[int] = None,
+                 rank: int = 0,
+                 world_size: int = 1):
         self.tokenizer = tokenizer
         self.is_training = is_training
         self.max_tokens = max_tokens
         self.trie_dropout = trie_dropout
         self.residue_mlm = residue_mlm
+        # Residue budget for the residue-MLM path. Must not exceed the number
+        # of rows in ThemeEncoder.global_pos_emb (3 * max_tokens), otherwise
+        # the residue head indexes out of range. Token spans differ per
+        # tokenizer (ZEST up to 10 residues/token, BPE up to 5), so
+        # max_tokens alone does not bound the residue count.
+        if max_residues is None:
+            max_residues = 3 * max_tokens if max_tokens else None
+        self.max_residues = max_residues
         self._seq_column = seq_column
         self._lang_column = lang_column
         self._seed = seed
+        self._rank = rank
+        self._world_size = world_size
         self._unique = unique_shards
         self._encoder = encoder
         self._langs: Optional[List[str]] = None
@@ -121,11 +134,11 @@ class MLMDataset(Dataset):
 
         if self._shard_schedule is not None:
             idx = epoch % len(self._shard_schedule)
-            selected = self._shard_schedule[idx]
+            selected = self._rank_shards(self._shard_schedule[idx])
         else:
             n = min(self._shards_per_epoch, len(self._shard_paths))
             rng = random.Random(self._seed + epoch)
-            selected = rng.sample(self._shard_paths, n)
+            selected = self._rank_shards(rng.sample(self._shard_paths, n))
 
         seqs: List[str] = []
         langs: List[str] = [] if self._lang_column else None
@@ -141,7 +154,33 @@ class MLMDataset(Dataset):
                 langs.extend(df[self._lang_column].tolist())
         self._seqs = seqs
         self._langs = langs
-        _log.info("Epoch %d: loaded %d shards (%d sequences)", epoch, len(selected), len(self._seqs))
+        message = (f"Rank {self._rank}/{self._world_size} epoch {epoch}: "
+               f"loaded shards "
+               f"{','.join(os.path.basename(path) for path in selected)} "
+               f"({len(self._seqs)} sequences)")
+        _log.info(message)
+        print(message, flush=True)
+
+    def _rank_shards(self, selected: List[str]) -> List[str]:
+        """Assign selected shards disjointly and balance rows across ranks."""
+        if self._world_size == 1:
+            return selected
+        ranked = []
+        for path in selected:
+            try:
+                import pyarrow.parquet as pq
+                rows = pq.ParquetFile(path).metadata.num_rows
+            except (ImportError, OSError):
+                rows = 0
+            ranked.append((rows, path))
+        assignments = [[] for _ in range(self._world_size)]
+        totals = [0] * self._world_size
+        for rows, path in sorted(ranked, key=lambda item: (-item[0], item[1])):
+            target = min(range(self._world_size),
+                         key=lambda index: (totals[index], len(assignments[index]), index))
+            assignments[target].append(path)
+            totals[target] += rows
+        return assignments[self._rank]
 
     def __len__(self) -> int:
         return len(self._seqs)
@@ -157,6 +196,7 @@ class MLMDataset(Dataset):
             segments = self.tokenizer._segment(symbols, dropout)
             if self.max_tokens and len(segments) > self.max_tokens:
                 segments = segments[:self.max_tokens]
+            segments = _truncate_to_residues(segments, self.max_residues)
             token_ids = [tid for _, tid in segments]
             token_lengths = [length for length, _ in segments]
             n_residues = sum(token_lengths)
@@ -184,6 +224,23 @@ class MLMDataset(Dataset):
         return {"input_ids": torch.tensor(ids, dtype=torch.long)}
 
 
+def _truncate_to_residues(segments: List, max_residues: Optional[int]) -> List:
+    """Drop trailing tokens so the segments span at most *max_residues*.
+
+    Truncating whole tokens (rather than clipping the residue arrays) keeps
+    ``token_ids``, ``token_lengths`` and ``aa_labels`` mutually consistent:
+    ``sum(token_lengths) == len(aa_labels)`` still holds afterwards.
+    """
+    if not max_residues:
+        return segments
+    total = 0
+    for i, (length, _) in enumerate(segments):
+        if total + length > max_residues:
+            return segments[:i]
+        total += length
+    return segments
+
+
 def _gate_aa_labels(to_mask: torch.Tensor, tl: torch.Tensor, aa: torch.Tensor):
     """Set aa_labels to -100 at residues belonging to unmasked tokens.
 
@@ -204,9 +261,51 @@ def _gate_aa_labels(to_mask: torch.Tensor, tl: torch.Tensor, aa: torch.Tensor):
     aa[~res_mask] = -100
 
 
+def _sample_span_mask(attn_mask: torch.Tensor, mask_prob: float,
+                      min_span: int, max_span: int) -> torch.Tensor:
+    """Select contiguous runs of tokens totalling ~``mask_prob`` of each sequence.
+
+    Independent Bernoulli masking lets the model lean on the immediately
+    surrounding residues, which amino-acid identity can be guessed from without
+    representing structure. Removing a whole run forces the head to reconstruct
+    the interior from context alone, and at these lengths (3-8 ZEST tokens,
+    roughly 10-25 residues) that spans more than one helical turn, so
+    periodicity has to be modelled rather than interpolated.
+    """
+    batch, num_tokens = attn_mask.shape
+    to_mask = torch.zeros(batch, num_tokens, dtype=torch.bool)
+    max_span = max(min_span, min(max_span, num_tokens))
+
+    for b in range(batch):
+        n_valid = int(attn_mask[b].sum())
+        if n_valid == 0:
+            continue
+        budget = int(round(mask_prob * n_valid))
+        if budget <= 0:
+            continue
+        # Bounded attempts: short sequences can saturate before the budget is
+        # met, and an unbounded loop would hang the data workers.
+        attempts = 0
+        limit = 10 * max(1, budget)
+        while int(to_mask[b].sum()) < budget and attempts < limit:
+            attempts += 1
+            span = int(torch.randint(min_span, max_span + 1, (1,)).item())
+            span = min(span, n_valid)
+            start = int(torch.randint(0, max(1, n_valid - span + 1), (1,)).item())
+            to_mask[b, start:start + span] = True
+    return to_mask & attn_mask
+
+
 def mlm_collate_fn(batch: List[Dict], pad_id: int = 0, mask_id: int = 4,
-                   vocab_size: int = 32000, mask_prob: float = 0.15):
-    """Collate with BERT-style masking: 80% [MASK], 10% random, 10% keep."""
+                   vocab_size: int = 32000, mask_prob: float = 0.15,
+                   span_mask: bool = False, min_span: int = 3, max_span: int = 8):
+    """Collate with BERT-style masking: 80% [MASK], 10% random, 10% keep.
+
+    With ``span_mask=True`` the selected tokens form contiguous runs instead of
+    independent draws. Everything downstream is unchanged: ``_gate_aa_labels``
+    still expands the token mask to residues, so contiguous tokens give
+    contiguous residue spans.
+    """
     ids = pad_sequence([b["input_ids"] for b in batch],
                        batch_first=True, padding_value=pad_id)
     attn_mask = ids != pad_id
@@ -215,8 +314,11 @@ def mlm_collate_fn(batch: List[Dict], pad_id: int = 0, mask_id: int = 4,
     to_mask = None
 
     if mask_prob > 0:
-        prob = torch.full(ids.shape, mask_prob).masked_fill_(~attn_mask, 0.0)
-        to_mask = torch.bernoulli(prob).bool()
+        if span_mask:
+            to_mask = _sample_span_mask(attn_mask, mask_prob, min_span, max_span)
+        else:
+            prob = torch.full(ids.shape, mask_prob).masked_fill_(~attn_mask, 0.0)
+            to_mask = torch.bernoulli(prob).bool()
 
         replace = torch.bernoulli(torch.full(ids.shape, 0.8)).bool() & to_mask
         masked_ids[replace] = mask_id
@@ -240,6 +342,8 @@ def mlm_collate_fn(batch: List[Dict], pad_id: int = 0, mask_id: int = 4,
             [b["global_indices"] for b in batch], batch_first=True, padding_value=0)
         aa = pad_sequence(
             [b["aa_labels"] for b in batch], batch_first=True, padding_value=-100)
+        # Keep the full (unmasked) AA labels for teacher distillation
+        out["aa_labels_full"] = aa.clone()
         if to_mask is not None:
             _gate_aa_labels(to_mask, tl, aa)
         out["aa_labels"] = aa

@@ -64,7 +64,7 @@ def encode_sequences(model, tokenizer, sequences: List[str],
 # ---------------------------------------------------------------------------
 
 _SCOPE_RE = re.compile(r"^>(\S+)\s+.*\b([a-g]\.\d+\.\d+\.\d+)\b")
-_CATH_DOMAIN_RE = re.compile(r"^>cath\|[\d.]+\|(\S+)")
+_CATH_DOMAIN_RE = re.compile(r"^>cath\|[^|]+\|([^/\s]+)")
 
 
 def parse_scope_fasta(path: str) -> List[Dict]:
@@ -302,7 +302,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="ThemeEncoder retrieval benchmark")
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--tokenizer", default=TOKENIZER_PATH)
-    p.add_argument("--tokenizer-type", default="zest", choices=["zest", "bpe", "char"])
+    p.add_argument("--tokenizer-type", default="zest", choices=["zest", "bpe"])
     p.add_argument("--retrieval-fasta", nargs="+", default=[])
     p.add_argument("--scope-fasta", default=None)
     p.add_argument("--cath-domain-list", default=None)
@@ -325,11 +325,8 @@ def main():
         sys.exit(1)
 
     if args.tokenizer_type == "bpe":
-        from experiments.biology.build_protein_bpe_tokenizer import ProteinBPETokenizer
+        from zest.tokenizer_bpe import ProteinBPETokenizer
         tokenizer = ProteinBPETokenizer(args.tokenizer)
-    elif args.tokenizer_type == "char":
-        from experiments.biology.char_tokenizer import CharTokenizer
-        tokenizer = CharTokenizer()
     else:
         tokenizer = ZESTTokenizer(args.tokenizer)
     model, _ = ThemeEncoder.load_pretrained(args.checkpoint, device="cpu")

@@ -1,98 +1,140 @@
-# ZEST: Injecting Inductive Bias at Tokenizer level
+# LEMON-ZEST: Evolution-Informed Tokenization for Efficient Protein Language Modeling
 
-Domain-informed tokenization enables small models to match or exceed
-much larger baselines. We demonstrate this across two domains:
-**proteins** (Nature's code) and **programming languages** (Human code).
+**ZEST** (*Zoned Encoding of Sequence Themes*) is a motif-level protein tokenizer built from evolutionarily conserved sequence patterns (~3.3 residues/token across a 32K vocabulary). **LEMON** (`ThemeEncoder`) pairs ZEST with a compact 200M-parameter Transformer encoder, a hierarchical contrastive projection head for remote homology retrieval, and an AlphaFold-style **RecycledResidueDecoder** for per-residue sequence and structure tasks.
 
-## Key Result
+## Architecture
 
-A 70M-parameter model with ZEST tokenization matches a 3B-parameter
-baseline (ProtTucker/ProtT5-XL) on fold-level protein remote homology —
-a **43× parameter reduction** explained by a measurable information-theoretic
-advantage: ZEST tokens carry **1.7× more task-relevant bits** than standard BPE.
-
-## τ(T): Task-Relevant Bits Per Token
-
-We introduce τ(T), a pre-training metric quantifying tokenizer inductive bias:
-
-```
-τ(T) = I(T; Y) / E[tokens per sequence]
+```text
+Amino-acid sequence
+   └─► ZESTTokenizer (32K motif trie, ~3.3 aa/token)
+          └─► Encoder (24× RoPE + SwiGLU Flash-Attention Transformer, D=768)
+                 ├─► Representation Head: AttentionAggregator → Bottleneck MLP → 384-D L2 embedding
+                 └─► RecycledResidueDecoder: Expand + FiLM(offset) → N× shared RefinementBlock
+                     (±2 token cross-attn + ±16 residue self-attn + SwiGLU) → 384-D residue features & 20-AA logits
 ```
 
-where I(T; Y) is the mutual information between the token vocabulary and
-task labels. Higher τ = more informative tokenization = better scaling.
+See [docs/lemon.mermaid](docs/lemon.mermaid) for the full diagram.
 
 ## Repository Structure
 
+```text
+zest/
+  tokenizer.py             # ZEST greedy max-match motif trie tokenizer
+  tokenizer_bpe.py         # Protein BPE tokenizer (for tokenization ablations)
+  model/
+    encoder.py             # RoPE + SwiGLU Flash-Attention Transformer encoder
+    theme_encoder.py       # ThemeEncoder + presets (test / base / deep) + strict checkpoint loader
+    heads.py               # RecycledResidueDecoder & RefinementBlock
+    pooling.py             # AttentionAggregator
+    positional.py          # Rotary & scaled positional embeddings
+  data/
+    pretrain.py            # UniRef MLM / MPM datasets with span masking & residue-budget truncation
+    finetune.py            # Hierarchical CATH pair dataset (A/T/H levels)
+    netsurfp.py            # Leakage-checked NetSurfP-3.0 / CB513 loader
+    download.py            # Automated benchmark dataset fetcher
+    loaders.py             # FASTA / Parquet / text sequence loaders
+  training/
+    pretrain.py            # Single-GPU / DDP token + residue MLM pretraining
+    finetune.py            # Hierarchical contrastive + auxiliary residue fine-tuning
+    losses.py              # Hierarchical InfoNCE, hard-positive InfoNCE, SmoothAP, margin ranking, memory bank
+    steps.py               # Training / evaluation step helpers
+    utils.py               # CheckpointManager, LLRD, cosine schedules, logging
+  evaluation/
+    benchmark.py           # SCOPe / CATH retrieval evaluation
+    residue_probe.py       # Leakage-free residue-level linear probe with paired chain bootstrap
+  analysis/
+    tau.py                 # τ(T) task-relevant bits per token metric
+data/tokens/               # Canonical 32K ZEST and BPE vocabularies
+scripts/
+  train.sh                 # End-to-end pretrain → contrastive fine-tune → retrieval eval template
+  contrastive_finetune.py  # Clean single-GPU contrastive head fine-tuning with P-K batch sampling
+experiments/biology/       # τ(T) computation scripts
+tests/                     # Unit test suite (pytest)
 ```
-zest/                          # Shared library
-  model/                       # Transformer encoder, pruning, presets
-  tokenizer.py                 # ZEST: Zoned Encoding of Sequence Themes
-  data/                        # Pretrain (MPM) + fine-tune (hierarchical pairs)
-  training/                    # Pretrain + contrastive fine-tune pipelines
-  evaluation/                  # Retrieval benchmarks
-  analysis/                    # τ(T) computation, scaling analysis
 
-experiments/
-  biology/                     # Protein remote homology
-    compute_tau.py             # τ for ZEST vs BPE on SCOPe/CATH
-    README.md                  # Full experiment plan
-  code/                        # Code clone/defect detection
-    build_tokenizer.py         # tree-sitter lexing → ZEST-Code vocab
-    compute_tau.py             # τ for ZEST-Code vs BPE on POJ-104
-    README.md                  # Full experiment plan
+> **Note on Benchmarking**: A unified multi-model benchmarking suite is tracked separately and will be added in a follow-up PR. Core SCOPe/CATH retrieval (`zest.evaluation.benchmark`) and leakage-free residue probing (`zest.evaluation.residue_probe`) are included in this package.
+
+## Installation
+
+```bash
+pip install -e .
 ```
 
-## Approach
+For development and running tests:
 
-### Train one large model, prune to many sizes
-
-Instead of training N models from scratch, we pretrain one large model
-per tokenizer and use **layer pruning** to create smaller variants:
-
-```python
-from zest.model import prune_checkpoint
-
-# 70M (16 layers) → 30M (4 layers)
-model_30M, _ = prune_checkpoint("path/to/70M.pth", keep_layers=4, strategy="uniform")
-
-# 70M (16 layers) → 43M (8 layers)
-model_43M, _ = prune_checkpoint("path/to/70M.pth", keep_layers=8, strategy="uniform")
+```bash
+pip install -e ".[dev]"
+pytest tests/
 ```
-
-Each pruned model gets hierarchical fine-tuning, producing multiple
-data points on the scaling curve from a single pretrained checkpoint.
-
-### Biology: Protein Remote Homology
-
-- **ZEST tokenizer**: Greedy max-match over 32K structural motifs mined from Pfam
-- **Pretraining**: Masked Profile Modeling on UniRef50
-- **Fine-tuning**: Hierarchical contrastive learning on CATH pairs
-- **Benchmarks**: SCOPe 2.08, CATH S20 v4.4 (mAP, fold AUC, top-k recall)
-
-### Code: Clone & Defect Detection
-
-- **ZEST-Code tokenizer**: Greedy max-match over 32K syntax patterns mined via tree-sitter
-- **Pretraining**: Masked Language Modeling on CodeSearchNet (6 languages)
-- **Benchmarks**: POJ-104 (MAP@R), Devign (accuracy)
 
 ## Quick Start
 
-```bash
-pip install -r requirements.txt
+### Load a Pretrained Checkpoint & Extract Embeddings
 
-# Compute τ(T) for proteins (CPU only)
-python experiments/biology/compute_tau.py \
-    --scope-fasta data/scope40.fa --cath-fasta data/cath_s20.fa
+```python
+import torch
+from zest import ZESTTokenizer, ThemeEncoder
 
-# Build ZEST-Code tokenizer
-python experiments/code/build_tokenizer.py \
-    --codesearchnet-dir data/code/codesearchnet/ \
-    --output data/code/zest_code_vocab.json
+tokenizer = ZESTTokenizer("data/tokens/tedlh_zest_32K.json")
+model, ckpt = ThemeEncoder.load_pretrained("path/to/best.pth", device="cuda")
+model.eval()
+
+seq = "MKTLLLTLVVVTIVCLDLGYT"
+ids = tokenizer.encode(seq)
+tokens = torch.tensor([ids], device="cuda")
+mask = torch.ones_like(tokens, dtype=torch.bool)
+
+with torch.no_grad():
+    # Sequence-level contrastive embedding [1, 384]
+    seq_emb = model.project_family(tokens, mask, temperature=None)
+
+    # Token-level encoder representations [1, T, 768]
+    tok_embs = model.encode_tokens(tokens, mask)
 ```
 
-## Citation
+### Extract Per-Residue Representations & Logits (`RecycledResidueDecoder`)
+
+```python
+segments = tokenizer._segment(list(seq), dropout=0.0)
+token_ids = [tid for _, tid in segments]
+token_lengths = [length for length, _ in segments]
+n_res = sum(token_lengths)
+
+tokens = torch.tensor([token_ids], device="cuda")
+mask = torch.ones_like(tokens, dtype=torch.bool)
+lengths = torch.tensor([token_lengths], device="cuda")
+global_idx = torch.arange(n_res, device="cuda").unsqueeze(0)
+
+with torch.no_grad():
+    aa_logits, res_features = model.forward_residue_mlm(
+        tokens, mask, lengths, global_idx, return_features=True
+    )
+    # aa_logits: [1, L, 20], res_features: [1, L, 384]
+```
+
+### Training
+
+```bash
+# 1. Pretrain (single GPU or torchrun DDP)
+python -m zest.training.pretrain \
+    --model deep \
+    --tokenizer data/tokens/tedlh_zest_32K.json \
+    --train-data path/to/uniref_train_shards \
+    --val-data path/to/uniref_val_shards \
+    --span-mask --amp
+
+# 2. Hierarchical contrastive fine-tuning (CATH)
+python -m zest.training.finetune \
+    --checkpoint path/to/pretrain/best.pth \
+    --tokenizer data/tokens/tedlh_zest_32K.json \
+    --shards-dir path/to/cath_pair_shards \
+    --amp
+
+# 3. Compute τ(T) tokenizer information metric (CPU)
+python experiments/biology/compute_tau.py \
+    --scope-fasta data/scope40.fa --cath-fasta data/cath_s20.fa
+```
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

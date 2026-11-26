@@ -1,100 +1,69 @@
 #!/usr/bin/env bash
-# ZEST training pipeline: MPM pretrain → hierarchical fine-tune
-# Adjust paths and hyperparameters for your setup.
+# LEMON-ZEST training pipeline: MLM pretraining -> hierarchical contrastive fine-tuning -> retrieval eval
+# Adjust data paths and hyperparameters for your environment.
 
 set -euo pipefail
 
-MODEL="efficient-deep"   # base | efficient-deep | deep-wide
-OUTPUT="outputs/models"
+MODEL="${MODEL:-deep}"
+TOKENIZER="${TOKENIZER:-data/tokens/tedlh_zest_32K.json}"
+TRAIN_DATA="${TRAIN_DATA:-data/uniref90/train}"
+VAL_DATA="${VAL_DATA:-data/uniref90/val}"
+CATH_SHARDS="${CATH_SHARDS:-data/cath/shards}"
+OUTPUT="${OUTPUT:-outputs/models}"
 
 # ======================================================================
-# Phase 1: Masked Profile Modeling (MPM) Pretraining
+# Phase 1: Token + Residue MLM Pretraining (RecycledResidueDecoder)
 # ======================================================================
-# 2 frozen epochs (profile head warmup) + 6 end-to-end epochs
-# Token MLM is an auxiliary anti-forgetting loss (weight 0.1)
-
-echo "=== Phase 1: MPM Pretraining ==="
+echo "=== Phase 1: Pretraining ($MODEL) ==="
 python -m zest.training.pretrain \
     --model "$MODEL" \
-    --frozen-epochs 2 \
-    --e2e-epochs 6 \
-    --batch-size 128 \
-    --grad-accum-steps 8 \
-    --lr 1e-4 \
-    --llrd-decay 0.85 \
-    --token-mlm-weight 0.1 \
-    --warmup-ratio 0.05 \
+    --tokenizer "$TOKENIZER" \
+    --train-data "$TRAIN_DATA" \
+    --val-data "$VAL_DATA" \
+    --batch-size 64 \
+    --grad-accum-steps 4 \
+    --lr 3e-4 \
     --max-tokens 1024 \
+    --token-mlm-weight 0.7 \
+    --residue-mlm-weight 0.3 \
+    --span-mask \
     --amp \
     --output-dir "$OUTPUT"
 
-# Find the latest run directory
 RUN_DIR=$(ls -td "$OUTPUT"/"$MODEL"_* | head -1)
-MPM_CKPT="$RUN_DIR/models/lemon_mpm_best.pth"
-echo "MPM checkpoint: $MPM_CKPT"
+PRETRAIN_CKPT="$RUN_DIR/pretrain/best.pth"
+echo "Pretrain checkpoint: $PRETRAIN_CKPT"
 
 # ======================================================================
-# Phase 2a: Hierarchical Fine-tuning (frozen encoder)
+# Phase 2: Hierarchical Contrastive Fine-tuning (CATH)
 # ======================================================================
-# Train projector + aggregator + similarity head with frozen encoder.
-# Uses InfoNCE + SmoothAP + margin ranking.
-
-echo "=== Phase 2a: Hierarchical Fine-tuning (frozen) ==="
+echo "=== Phase 2: Contrastive Fine-tuning ==="
 python -m zest.training.finetune \
-    --checkpoint "$MPM_CKPT" \
-    --epochs 8 \
-    --batch-size 1024 \
-    --grad-accum-steps 1 \
-    --lr 3e-4 \
-    --encoder-lr-scale 0.0 \
-    --unfreeze-layers 0 \
-    --warmup-ratio 0.05 \
-    --contrastive-weight 1.0 \
-    --smooth-ap-weight 0.4 \
-    --rank-weight 0.3 \
-    --memory-bank-size 16384 \
-    --hard-neg-weight 2.0 \
-    --max-tokens 512 \
-    --output-dir "$OUTPUT"
-
-FROZEN_DIR=$(ls -td "$OUTPUT"/finetune_* | head -1)
-FROZEN_CKPT="$FROZEN_DIR/models/lemon_hier_latest.pth"
-
-# ======================================================================
-# Phase 2b: Full unfreeze (fine-tune entire model)
-# ======================================================================
-# Unfreeze all encoder layers + embeddings. Lower encoder LR via LLRD.
-# No warmup needed when resuming from trained weights.
-
-echo "=== Phase 2b: Full Unfreeze ==="
-python -m zest.training.finetune \
-    --checkpoint "$FROZEN_CKPT" \
+    --checkpoint "$PRETRAIN_CKPT" \
+    --tokenizer "$TOKENIZER" \
+    --shards-dir "$CATH_SHARDS" \
     --epochs 8 \
     --batch-size 128 \
-    --grad-accum-steps 8 \
-    --lr 5e-4 \
+    --grad-accum-steps 4 \
+    --lr 3e-4 \
     --encoder-lr-scale 0.2 \
     --unfreeze-layers -1 \
-    --unfreeze-embeddings \
-    --llrd-decay 0.9 \
-    --warmup-ratio 0.0 \
-    --contrastive-weight 1.0 \
-    --smooth-ap-weight 0.4 \
-    --rank-weight 0.3 \
     --memory-bank-size 16384 \
     --hard-neg-weight 2.0 \
     --max-tokens 512 \
+    --amp \
     --output-dir "$OUTPUT"
 
 FINAL_DIR=$(ls -td "$OUTPUT"/finetune_* | head -1)
-FINAL_CKPT="$FINAL_DIR/models/lemon_hier_latest.pth"
+FINAL_CKPT="$FINAL_DIR/finetune/best.pth"
 
 # ======================================================================
-# Benchmark
+# Phase 3: SCOPe / CATH Retrieval Benchmark
 # ======================================================================
-echo "=== Benchmarking ==="
+echo "=== Phase 3: Retrieval Evaluation ==="
 python -m zest.evaluation.benchmark \
     --checkpoint "$FINAL_CKPT" \
+    --tokenizer "$TOKENIZER" \
     --scope-fasta data/astral-scopedom-seqres-gd-sel-gs-bib-40-2.08.fa \
     --retrieval-fasta data/cath-dataset-nonredundant-S20-v4_4_0.fa
 

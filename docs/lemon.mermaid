@@ -15,12 +15,12 @@ flowchart LR
     input(["<b style='font-size:16px'>Input</b><br/><i>x</i> ∈ <b>Z</b><sup>B×T</sup>"])
 
     %% ── Embedding ──
-    emb["<b style='font-size:16px'>ZEST <br/>Embedding</b>"]
+    emb["<b style='font-size:16px'>ZEST<br/>Embedding</b>"]
 
-    %% ── Encoder > N × Block > MHA + FFN ──
+    %% ── Encoder ──
     subgraph ENC ["<b>Encoder</b>"]
         direction LR
-        BLK["<b>24 x Transformer Block</b><br/>MHA → SwiGLU FFN"]
+        BLK["<b>24 × Transformer Block</b><br/>RoPE MHA → SwiGLU FFN"]
         fnorm["Final LayerNorm"]
         BLK --> |⊕ res| fnorm
     end
@@ -28,15 +28,17 @@ flowchart LR
     %% ── Shared representation ──
     z(["<b style='font-size:16px'>z</b> ∈ <b>R</b><sup>B×T×D</sup>"])
 
-    %% ── Sequence Head (Profile Expansion) ──
-    subgraph P1 ["<b>Sequence Head</b>"]
+    %% ── Recycled Residue Decoder ──
+    subgraph P1 ["<b>RecycledResidueDecoder</b>"]
         direction TB
-        expand["<b>Expand + Pos. Enc.</b><br/><i>z</i><sup>B×<b>T</b>×D</sup> → <i>z</i><sup>B×<b>L</b>×D</sup>"]
-        resmlp["<b>Bottleneck MLP</b>"]
-        expand --> resmlp
+        expand["<b>Expand + FiLM(offset) + Global Pos</b><br/><i>z</i><sup>B×<b>T</b>×D</sup> → <i>h</i><sup>B×<b>L</b>×H</sup>"]
+        cycle["<b>N × Shared RefinementBlock (Cycle FiLM)</b><br/>±2 Token Cross-Attn → ±16 Res Self-Attn → SwiGLU"]
+        outproj["<b>LayerNorm → AA Linear</b>"]
+        expand --> cycle --> outproj
     end
-    out1(["<b style='font-size:15px'><i>r</i></b> ∈ <b>R</b><sup>B×L×20</sup>"])
+    out1(["<b style='font-size:15px'><i>r</i></b> ∈ <b>R</b><sup>B×L×20</sup><br/>+ <i>z</i><sub>res</sub> ∈ <b>R</b><sup>B×L×H</sup>"])
 
+    %% ── Representation Head ──
     subgraph P2 ["<b>Representation Head</b>"]
         direction TB
         agg["<b>Attention Aggregator</b><br/><i>z</i><sup>B×T×D</sup> → <i>h</i><sup>B×D</sup>"]
@@ -49,10 +51,10 @@ flowchart LR
     input --> emb --> |⊕ RoPE| ENC
     fnorm --> z
     z --> expand
-    resmlp --> out1
+    z -. "token KV" .-> cycle
+    outproj --> out1
     z --> agg
     proj --> out2
-    
 
     %% ── Styling ──
     classDef inputNode fill:#F1F3F5,stroke:#ADB5BD,stroke-width:1.5px,color:#495057
@@ -65,11 +67,10 @@ flowchart LR
     class input inputNode
     class emb,fnorm encNode
     class BLK blkNode
-    class expand,resmlp p1Node
+    class expand,cycle,outproj p1Node
     class agg,proj p2Node
     class z,out1,out2 outNode
 
-    %% ── Subgraph styling ──
     style ENC fill:#E9EEF5,opacity:0.5,stroke:#74C0FC,stroke-width:1.5px,color:#1971C2,rx:10,ry:10
     style P1 fill:#E9F5E9,opacity:0.5,stroke:#69DB7C,stroke-width:1.5px,color:#2B8A3E,rx:10,ry:10
     style P2 fill:#FFF5E6,opacity:0.5,stroke:#FFD43B,stroke-width:1.5px,color:#E67700,rx:10,ry:10

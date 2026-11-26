@@ -7,7 +7,7 @@ import platform
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -121,9 +121,41 @@ class CheckpointManager:
         self.best_epoch: int = 0
         self._train_epochs: List[Dict] = []
         self._val_epochs: List[Dict] = []
+        self._val_steps: List[Dict] = []
         self._saved: List[Path] = sorted(self.phase_dir.glob("epoch_*.pth"))
 
         self._load_metrics()
+
+    # ------------------------------------------------------------------
+    # Split export: model-only + training-state
+    # ------------------------------------------------------------------
+
+    def _export_split(self, model: nn.Module, ckpt: Dict,
+                      stem: str) -> Tuple[Path, Path]:
+        """Write two companion files next to the main checkpoint.
+
+        ``<stem>_model.pth``   — model weights + config (for inference)
+        ``<stem>_state.pth``   — optimizer, scheduler, metadata (for resume)
+
+        The main combined checkpoint is still written by the caller so that
+        existing resume code keeps working unchanged.
+        """
+        m = model._orig_mod if hasattr(model, "_orig_mod") else model
+        model_path = self.phase_dir / f"{stem}_model.pth"
+        state_path = self.phase_dir / f"{stem}_state.pth"
+
+        model_ckpt = {
+            "model_state_dict": m.state_dict(),
+            "config": getattr(m, "config", {}),
+            "epoch": ckpt.get("epoch", 0),
+            "global_step": ckpt.get("global_step", 0),
+        }
+        state_ckpt = {k: v for k, v in ckpt.items()
+                      if k != "model_state_dict"}
+
+        torch.save(model_ckpt, model_path)
+        torch.save(state_ckpt, state_path)
+        return model_path, state_path
 
     # ------------------------------------------------------------------
     # Save
@@ -136,7 +168,8 @@ class CheckpointManager:
              val_metrics: Optional[Dict] = None,
              lr: float = 0.0,
              train_elapsed_s: float = 0.0,
-             val_elapsed_s: float = 0.0) -> Path:
+             val_elapsed_s: float = 0.0,
+             extra_state: Optional[Dict[str, Any]] = None) -> Path:
         m = model._orig_mod if hasattr(model, "_orig_mod") else model
 
         # Best tracking
@@ -159,11 +192,14 @@ class CheckpointManager:
         }
         if scheduler:
             ckpt["scheduler_state_dict"] = scheduler.state_dict()
+        if extra_state:
+            ckpt.update(extra_state)
 
         # Save epoch file
         path = self.phase_dir / f"epoch_{epoch}.pth"
         torch.save(ckpt, path)
         self._saved.append(path)
+        self._export_split(model, ckpt, f"epoch_{epoch}")
 
         # Symlink latest
         self._symlink(self.phase_dir / "latest.pth", path.name)
@@ -195,6 +231,58 @@ class CheckpointManager:
 
         self._save_metrics()
         self._cleanup()
+        return path
+
+    def save_step(self, model: nn.Module, optimizer: Optimizer,
+                  scheduler: Optional[LRScheduler] = None,
+                  epoch: int = 0, global_step: int = 0,
+                  keep_step_ckpts: int = 2,
+                  batch_index: int = 0,
+                  extra_state: Optional[Dict[str, Any]] = None) -> Path:
+        """Save an intra-epoch checkpoint for fault tolerance.
+
+        The checkpoint is marked with ``intra_epoch=True`` so the resume
+        logic can restart the same epoch instead of advancing to the next.
+        Only the last *keep_step_ckpts* step checkpoints are kept.
+        """
+        m = model._orig_mod if hasattr(model, "_orig_mod") else model
+        ckpt = {
+            "model_state_dict": m.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": epoch,
+            "global_step": global_step,
+            "batch_index": batch_index,
+            "best_val_loss": self.best_val_loss,
+            "best_epoch": self.best_epoch,
+            "config": getattr(m, "config", {}),
+            "intra_epoch": True,
+        }
+        if scheduler:
+            ckpt["scheduler_state_dict"] = scheduler.state_dict()
+        if extra_state:
+            ckpt.update(extra_state)
+
+        path = self.phase_dir / f"step_{global_step}.pth"
+        torch.save(ckpt, path)
+        self._export_split(model, ckpt, f"step_{global_step}")
+        self._symlink(self.phase_dir / "latest.pth", path.name)
+
+        # Clean up old step checkpoints (combined + split)
+        step_ckpts = sorted(
+            self.phase_dir.glob("step_*.pth"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        # Exclude _model.pth and _state.pth from the combined count
+        combined = [p for p in step_ckpts
+                    if not p.stem.endswith("_model")
+                    and not p.stem.endswith("_state")]
+        while len(combined) > keep_step_ckpts:
+            old = combined.pop(0)
+            step_num = old.stem  # e.g. "step_500"
+            old.unlink(missing_ok=True)
+            (self.phase_dir / f"{step_num}_model.pth").unlink(missing_ok=True)
+            (self.phase_dir / f"{step_num}_state.pth").unlink(missing_ok=True)
+
         return path
 
     # ------------------------------------------------------------------
@@ -234,13 +322,78 @@ class CheckpointManager:
     # Metrics persistence
     # ------------------------------------------------------------------
 
+    def log_step_metrics(self, epoch: int, global_step: int,
+                         val_metrics: Dict, lr: float = 0.0) -> bool:
+        """Record intra-epoch validation metrics. Returns True if it is a best.
+
+        Long epochs may never complete inside a SLURM wall-time window, in
+        which case :meth:`save` is never reached and no validation metric is
+        ever persisted. This appends to a ``val.steps`` list so progress is
+        still visible, and keeps ``best_val_loss`` up to date.
+
+        The caller is expected to act on the return value by calling
+        :meth:`save_best`; otherwise ``best_val_loss`` moves below what any
+        epoch-end validation can beat and ``best.pth`` is never written.
+        """
+        _round = lambda v: round(v, 6) if isinstance(v, float) else v
+        self._val_steps.append({
+            "epoch": epoch,
+            "global_step": global_step,
+            "wall_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "lr": lr,
+            **{k: _round(v) for k, v in val_metrics.items()},
+        })
+
+        is_best = False
+        val_loss = val_metrics.get("loss")
+        if val_loss is not None and val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
+            self.best_epoch = epoch
+            is_best = True
+
+        self._save_metrics()
+        return is_best
+
+    def save_best(self, model: nn.Module, optimizer: Optimizer,
+                  scheduler: Optional[LRScheduler] = None,
+                  epoch: int = 0, global_step: int = 0,
+                  **extra) -> Path:
+        """Write ``best.pth`` directly (used for intra-epoch bests).
+
+        Unlike :meth:`save`, this writes a real file rather than a symlink to
+        an epoch checkpoint, so it survives step-checkpoint rotation.
+        Any additional keyword arguments are stored in the checkpoint dict.
+        """
+        m = model._orig_mod if hasattr(model, "_orig_mod") else model
+        ckpt = {
+            "model_state_dict": m.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": epoch,
+            "global_step": global_step,
+            "best_val_loss": self.best_val_loss,
+            "best_epoch": self.best_epoch,
+            "config": getattr(m, "config", {}),
+            "intra_epoch": True,
+        }
+        if scheduler:
+            ckpt["scheduler_state_dict"] = scheduler.state_dict()
+        ckpt.update(extra)
+
+        path = self.phase_dir / "best.pth"
+        tmp = self.phase_dir / "best.pth.tmp"
+        torch.save(ckpt, tmp)
+        path.unlink(missing_ok=True)   # may be a symlink from save()
+        tmp.rename(path)
+        self._export_split(model, ckpt, "best")
+        return path
+
     def _save_metrics(self):
         with open(self.metrics_path, "w") as f:
             json.dump({
                 "best_val_loss": self.best_val_loss if self.best_val_loss != float("inf") else None,
                 "best_epoch": self.best_epoch,
                 "train": {"epochs": self._train_epochs},
-                "val": {"epochs": self._val_epochs},
+                "val": {"epochs": self._val_epochs, "steps": self._val_steps},
             }, f, indent=2)
 
     def _load_metrics(self):
@@ -249,6 +402,7 @@ class CheckpointManager:
                 data = json.loads(self.metrics_path.read_text())
                 self._train_epochs = data.get("train", {}).get("epochs", [])
                 self._val_epochs = data.get("val", {}).get("epochs", [])
+                self._val_steps = data.get("val", {}).get("steps", [])
                 bvl = data.get("best_val_loss")
                 self.best_val_loss = bvl if bvl is not None else float("inf")
                 self.best_epoch = data.get("best_epoch", 0)
@@ -282,6 +436,10 @@ class CheckpointManager:
             if best_target and old.name == best_target:
                 continue
             old.unlink(missing_ok=True)
+            # Clean up companion split files
+            stem = old.stem  # e.g. "epoch_7"
+            (self.phase_dir / f"{stem}_model.pth").unlink(missing_ok=True)
+            (self.phase_dir / f"{stem}_state.pth").unlink(missing_ok=True)
             if old in self._saved:
                 self._saved.remove(old)
 
